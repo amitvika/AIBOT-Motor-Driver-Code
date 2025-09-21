@@ -1,0 +1,88 @@
+#include <Arduino.h>
+#include <math.h>
+
+//-- ⚙️ Motor Pin Definitions --//
+const int MOTOR1_PIN_A = 37;
+const int MOTOR1_PIN_B = 38;
+const int MOTOR2_PIN_A = 39;
+const int MOTOR2_PIN_B = 40;
+
+//-- ⚙️ Current Sensor Pin Definitions --//
+const int CURRENT_SENSE_PIN_1 = 8;
+const int CURRENT_SENSE_PIN_2 = 9;
+
+//-- PWM Configuration --//
+const int PWM_FREQUENCY = 5000;
+const int PWM_RESOLUTION = 8;
+const int MAX_DUTY_CYCLE = (1 << PWM_RESOLUTION) - 1; // 255
+
+//-- LEDC PWM Channels --//
+const int M1_CHAN_A = 0, M1_CHAN_B = 1, M2_CHAN_A = 2, M2_CHAN_B = 3;
+
+//-- Timing for Serial Printing --//
+unsigned long lastPrintTime = 0;
+const long printInterval = 20; // Print data every 20 ms
+
+/**
+ * @brief Controls a single H-bridge based on a value from -1.0 to 1.0.
+ */
+void driveMotor(float controlValue, int channelA, int channelB) {
+  int dutyCycle = (int)(fabs(controlValue) * MAX_DUTY_CYCLE);
+  if (controlValue > 0) {
+    ledcWrite(channelA, dutyCycle);
+    ledcWrite(channelB, 0);
+  } else if (controlValue < 0) {
+    ledcWrite(channelA, 0);
+    ledcWrite(channelB, dutyCycle);
+  } else {
+    ledcWrite(channelA, 0);
+    ledcWrite(channelB, 0);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+  Serial.println("--- Combined Motor Control & ADC Reading Test ---");
+  
+  // Configure PWM channels for motors
+  ledcSetup(M1_CHAN_A, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcAttachPin(MOTOR1_PIN_A, M1_CHAN_A);
+  ledcSetup(M1_CHAN_B, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcAttachPin(MOTOR1_PIN_B, M1_CHAN_B);
+  ledcSetup(M2_CHAN_A, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcAttachPin(MOTOR2_PIN_A, M2_CHAN_A);
+  ledcSetup(M2_CHAN_B, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcAttachPin(MOTOR2_PIN_B, M2_CHAN_B);
+
+  Serial.println("Setup complete. Running motors and monitoring ADC values...");
+}
+
+void loop() {
+  static float baseAngle = 0.0;
+
+  // --- Motor Control Logic ---
+  float motor1_control = sin(baseAngle);
+  float motor2_control = sin(baseAngle + M_PI);
+  driveMotor(motor1_control, M1_CHAN_A, M1_CHAN_B);
+  driveMotor(motor2_control, M2_CHAN_A, M2_CHAN_B);
+  
+  baseAngle += 0.05;
+  if (baseAngle >= (2.0 * M_PI)) {
+    baseAngle -= (2.0 * M_PI);
+  }
+
+  // --- ADC Sensing and Printing Logic ---
+  if (millis() - lastPrintTime >= printInterval) {
+    lastPrintTime = millis();
+
+    // Read the raw ADC values
+    int adcValue1 = analogRead(CURRENT_SENSE_PIN_1);
+    int adcValue2 = analogRead(CURRENT_SENSE_PIN_2);
+
+    // Print the raw values in a compact format
+    Serial.printf("ADC1: %-4d | ADC2: %-4d\n", adcValue1, adcValue2);
+  }
+
+  delay(10);
+}

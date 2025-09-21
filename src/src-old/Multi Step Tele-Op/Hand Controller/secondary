@@ -1,0 +1,58 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_BusIO_Register.h>
+#include <Adafruit_Sensor.h>
+#include <HTTPClient.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_BusIO_Register.h>
+#include <Adafruit_Sensor.h>
+#include <HTTPClient.h>
+#include <math.h>
+#include "Adafruit_VL53L0X.h"
+#include <Arduino.h>
+
+// Define pin assignments based on your wiring
+const int powerPin = 33; // Using digital pin 33 to provide "VCC"
+const int xPin = 32;     // Analog input for VRX (X-axis)
+const int yPin = 35;     // Analog input for VRY (Y-axis)
+const int swPin = 34;    // Digital input for the joystick's button (SW)
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Set up the power pin as output and drive it HIGH.
+  // This will output approximately 3.3V, not 5V.
+  pinMode(powerPin, OUTPUT);
+  digitalWrite(powerPin, HIGH);
+  
+  // Set up the joystick button pin with an internal pull-up resistor.
+  pinMode(swPin, INPUT_PULLUP);
+}
+
+void loop() {
+  // Read the analog values for the joystick axes.
+  int xValue = analogRead(xPin);
+  int yValue = analogRead(yPin);
+  
+  // Read the digital state of the joystick button.
+  int buttonState = digitalRead(swPin);
+  
+  // Print the values to the Serial Monitor.
+  Serial.print("X: ");
+  Serial.print(xValue);
+  Serial.print("  Y: ");
+  Serial.print(yValue);
+  Serial.print("  Button: ");
+  Serial.println(buttonState);
+  
+  delay(100); // Delay for readability.
+}

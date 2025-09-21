@@ -1,0 +1,95 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_BusIO_Register.h>
+#include <Adafruit_Sensor.h>
+#include <HTTPClient.h>
+#include <math.h> // for roundf()
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <math.h>
+#include <string.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+
+// ------------------- UART CONFIG -------------------
+#define UART_BAUD_RATE   115200    // Adjust as needed
+#define MAX_LINE_LENGTH  256
+#define UART_TX_PIN      17
+#define UART_RX_PIN      16
+
+// Use Serial1 for UART communication with the RPi.
+Stream* commPort;
+
+// Broadcast MAC address: 0xFF:FF:FF:FF:FF:FF
+uint8_t broadcastAddress[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+
+// Minimal ESP‑NOW send callback.
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  // Callback intentionally left empty for minimal overhead.
+}
+
+void setup() {
+  // Optional: Uncomment Serial.begin if you want USB debugging.
+  Serial.begin(115200);
+  delay(100);
+
+  // Initialize UART (Serial1) for communication with the RPi.
+  Serial1.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+  commPort = &Serial1;
+
+  // Set WiFi to station mode and disable power saving.
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.disconnect();
+
+  // Initialize ESP‑NOW.
+  if (esp_now_init() != ESP_OK) {
+    // If initialization fails, do nothing.
+  }
+  esp_now_register_send_cb(onDataSent);
+  
+  // Optionally add the broadcast peer.
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;  // Use the same channel as the master.
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+}
+
+void loop() {
+  static char buffer[MAX_LINE_LENGTH];
+  static int idx = 0;
+  
+  // Read available characters from the UART.
+  while (commPort->available() > 0) {
+    char c = (char)commPort->read();
+    
+    // When a newline is encountered, terminate the string and send it.
+    if (c == '\n') {
+      buffer[idx] = '\0';
+      if (idx > 0) {
+        // Send the received string as a broadcast message.
+        esp_now_send(broadcastAddress, (uint8_t*)buffer, idx + 1);
+      }
+      idx = 0;
+    } else {
+      // Accumulate characters until newline or buffer overflow.
+      if (idx < (MAX_LINE_LENGTH - 1)) {
+        buffer[idx++] = c;
+      } else {
+        // Reset the index if the buffer overflows.
+        idx = 0;
+      }
+    }
+  }
+  // Loop continuously with no added delay.
+}

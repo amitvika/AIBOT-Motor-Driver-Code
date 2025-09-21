@@ -1,0 +1,242 @@
+/*
+  Inverse Kinematics Example on ESP32
+  ------------------------------------
+  This sketch calculates the inverse kinematics (IK) for a 6–DOF robot
+  using a standardized set of DH parameters (similar to the KR210).
+  It then prints the computed joint angles (in degrees) to the Serial Monitor.
+  
+  The robot’s DH parameters are as follows:
+
+  Link   a_(i-1)    alpha_(i-1)    d_i     theta_i (variable)
+  1      0          0              0.75    theta1
+  2      0.35       -pi/2          0       theta2 - pi/2
+  3      1.25       0              0       theta3
+  4      -0.054     -pi/2          1.50    theta4
+  5      0          pi/2           0       theta5
+  6      0          -pi/2          0       theta6
+  EE     0          0              0.303   (end effector)
+  
+  The algorithm is as follows:
+    1. Compute the Wrist Center (WC) from the end-effector pose.
+    2. Compute theta1, theta2, theta3 using geometric relations.
+    3. Compute R0_3 (the rotation from base to joint 3) from the first three joints.
+    4. Compute R3_6 = R0_3^T * R_EE, then extract theta4, theta5, theta6.
+*/
+
+#include <Arduino.h>
+#include <math.h>
+
+// Helper constant for degree conversion:
+#define RAD2DEG 57.2957795
+
+// Define the DH parameters (in meters and radians):
+const double d1    = 0.75;
+const double a1    = 0.35;
+const double a2    = 1.25;
+const double a3    = -0.054;
+const double d4    = 1.50;
+const double d7    = 0.303;  // distance from wrist center to end-effector
+
+// Function prototypes:
+void computeIK(double px, double py, double pz, double roll, double pitch, double yaw);
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("Starting Inverse Kinematics Computation...");
+}
+
+void loop() {
+  // Example target pose for the end effector:
+  // You can change these values or update them to read from sensors or communication.
+  double px = 2.153;
+  double py = 0.0;
+  double pz = 1.946;
+  
+  // Orientation in roll, pitch, yaw (in radians)
+  double roll  = 0.0;
+  double pitch = 0.0;
+  double yaw   = 0.0;
+  
+  computeIK(px, py, pz, roll, pitch, yaw);
+  
+  // Compute and print IK every 2 seconds.
+  delay(2000);
+}
+
+// Utility: Create a rotation matrix from roll, pitch, yaw
+// Returns a 3x3 matrix stored in a 2D array R[3][3]
+void rpyToRotationMatrix(double roll, double pitch, double yaw, double R[3][3]) {
+  double r = roll;
+  double p = pitch;
+  double y = yaw;
+  
+  // Rotation about X (roll)
+  double R_x[3][3] = {
+    {1, 0, 0},
+    {0, cos(r), -sin(r)},
+    {0, sin(r), cos(r)}
+  };
+  
+  // Rotation about Y (pitch)
+  double R_y[3][3] = {
+    {cos(p), 0, sin(p)},
+    {0, 1, 0},
+    {-sin(p), 0, cos(p)}
+  };
+  
+  // Rotation about Z (yaw)
+  double R_z[3][3] = {
+    {cos(y), -sin(y), 0},
+    {sin(y), cos(y), 0},
+    {0, 0, 1}
+  };
+  
+  // Combined rotation: R = R_z * R_y * R_x
+  double Rzy[3][3];
+  // First compute R_z * R_y = Rzy
+  for (int i=0; i<3; i++){
+    for (int j=0; j<3; j++){
+      Rzy[i][j] = 0;
+      for (int k=0; k<3; k++){
+        Rzy[i][j] += R_z[i][k] * R_y[k][j];
+      }
+    }
+  }
+  
+  // Then compute R = (R_z*R_y) * R_x
+  for (int i=0; i<3; i++){
+    for (int j=0; j<3; j++){
+      R[i][j] = 0;
+      for (int k=0; k<3; k++){
+        R[i][j] += Rzy[i][k] * R_x[k][j];
+      }
+    }
+  }
+}
+
+// Main IK computation function:
+void computeIK(double px, double py, double pz, double roll, double pitch, double yaw) {
+  // Step 1. Compute the rotation matrix for the end effector
+  double R_EE[3][3];
+  rpyToRotationMatrix(roll, pitch, yaw, R_EE);
+  
+  // Step 2. Compute the wrist center (WC) position:
+  // WC = EE_position - d7 * (R_EE * [0, 0, 1]^T)
+  double nx = R_EE[0][2];  // third column, first row
+  double ny = R_EE[1][2];  // third column, second row
+  double nz = R_EE[2][2];  // third column, third row
+  
+  double wx = px - d7 * nx;
+  double wy = py - d7 * ny;
+  double wz = pz - d7 * nz;
+  
+  // Step 3. Calculate joint angle theta1
+  double theta1 = atan2(wy, wx);
+  
+  // Step 4. Calculate theta2 and theta3 using geometric relations.
+  // First, compute the distances for the triangle formed by joints 2, 3, and the WC.
+  // The position of joint 2 is at (a1, d1) in the base frame.
+  double side_a = sqrt(pow(d4, 2) + pow(a3, 2));  // distance between joint 3 and joint 4 (wrist)
+  // Distance from joint 2 to WC:
+  double dx = sqrt(pow(wx, 2) + pow(wy, 2)) - a1;
+  double dz = wz - d1;
+  double side_b = sqrt(dx*dx + dz*dz);
+  double side_c = a2;  // distance from joint 2 to joint 3
+  
+  // Using cosine law to calculate angles:
+  double angle_a = acos( (side_b*side_b + side_c*side_c - side_a*side_a) / (2 * side_b * side_c) );
+  double angle_b = acos( (side_c*side_c + side_a*side_a - side_b*side_b) / (2 * side_c * side_a) );
+  
+  double theta2 = (M_PI/2) - angle_a - atan2(dz, dx);
+  
+  // Note: For theta3, we account for the offset (using a3 and d4)
+  double theta3 = (M_PI/2) - (angle_b + atan2(fabs(a3), d4));
+  
+  // Step 5. Compute rotation matrix from base to joint 3 (R0_3)
+  // For brevity, we use the standard DH transformation matrices for the first three joints.
+  // Here we build each matrix using the DH parameters and the computed angles.
+  
+  // Helper lambda: DH transform from parameters a, alpha, d, theta.
+  auto DHTransform = [](double a, double alpha, double d, double theta, double T[4][4]) {
+    T[0][0] = cos(theta);              T[0][1] = -sin(theta);             T[0][2] = 0;             T[0][3] = a;
+    T[1][0] = sin(theta)*cos(alpha);     T[1][1] = cos(theta)*cos(alpha);     T[1][2] = -sin(alpha);    T[1][3] = -sin(alpha)*d;
+    T[2][0] = sin(theta)*sin(alpha);     T[2][1] = cos(theta)*sin(alpha);     T[2][2] = cos(alpha);     T[2][3] = cos(alpha)*d;
+    T[3][0] = 0;                       T[3][1] = 0;                       T[3][2] = 0;             T[3][3] = 1;
+  };
+  
+  double T0_1[4][4], T1_2[4][4], T2_3[4][4];
+  // For joint 1:
+  DHTransform(0, 0, d1, theta1, T0_1);
+  // For joint 2: note the offset of -pi/2 for theta2
+  DHTransform(a1, -M_PI/2, 0, theta2 - M_PI/2, T1_2);
+  // For joint 3:
+  DHTransform(a2, 0, 0, theta3, T2_3);
+  
+  // Multiply T0_1 * T1_2 to get T0_2, then T0_2 * T2_3 to get T0_3.
+  double T0_2[4][4], T0_3[4][4];
+  // Matrix multiplication helper (4x4 matrices):
+  auto matMult = [](double A[4][4], double B[4][4], double C[4][4]) {
+    for (int i=0; i<4; i++){
+      for (int j=0; j<4; j++){
+        C[i][j] = 0;
+        for (int k=0; k<4; k++){
+          C[i][j] += A[i][k] * B[k][j];
+        }
+      }
+    }
+  };
+  matMult(T0_1, T1_2, T0_2);
+  matMult(T0_2, T2_3, T0_3);
+  
+  // Extract rotation part R0_3 from T0_3 (upper left 3x3)
+  double R0_3[3][3];
+  for (int i=0; i<3; i++){
+    for (int j=0; j<3; j++){
+      R0_3[i][j] = T0_3[i][j];
+    }
+  }
+  
+  // Step 6. Compute R3_6 = R0_3^T * R_EE
+  double R0_3_T[3][3];
+  // Transpose R0_3:
+  for (int i=0; i<3; i++){
+    for (int j=0; j<3; j++){
+      R0_3_T[i][j] = R0_3[j][i];
+    }
+  }
+  double R3_6[3][3] = {0};
+  for (int i=0; i<3; i++){
+    for (int j=0; j<3; j++){
+      for (int k=0; k<3; k++){
+        R3_6[i][j] += R0_3_T[i][k] * R_EE[k][j];
+      }
+    }
+  }
+  
+  // Step 7. Extract the wrist joint angles (theta4, theta5, theta6) from R3_6.
+  double theta4, theta5, theta6;
+  
+  // Here, one common extraction is:
+  theta5 = atan2( sqrt(R3_6[0][2]*R3_6[0][2] + R3_6[1][2]*R3_6[1][2]), R3_6[2][2] );
+  
+  // To avoid division by zero, check sin(theta5)
+  if (fabs(sin(theta5)) < 1e-6) {
+    // Singularity: arbitrary assignment for theta4 and theta6
+    theta4 = 0;
+    theta6 = atan2(-R3_6[1][0], R3_6[0][0]);
+  } else {
+    theta4 = atan2(R3_6[2][1], R3_6[2][0]);
+    theta6 = atan2(-R3_6[1][2], R3_6[0][2]);
+  }
+  
+  // Print out the computed joint angles:
+  Serial.println("Computed Joint Angles (in degrees):");
+  Serial.print("theta1: "); Serial.println(theta1 * RAD2DEG, 2);
+  Serial.print("theta2: "); Serial.println(theta2 * RAD2DEG, 2);
+  Serial.print("theta3: "); Serial.println(theta3 * RAD2DEG, 2);
+  Serial.print("theta4: "); Serial.println(theta4 * RAD2DEG, 2);
+  Serial.print("theta5: "); Serial.println(theta5 * RAD2DEG, 2);
+  Serial.print("theta6: "); Serial.println(theta6 * RAD2DEG, 2);
+  Serial.println("--------------------------------");
+}

@@ -1,0 +1,325 @@
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <ArduinoWebsockets.h>
+
+using namespace websockets;
+
+// Replace with your Wi-Fi credentials
+const char* ssid = "The Best Is Yet To Come!";
+const char* password = "blessings1";
+
+// WebSocket client instance
+WebsocketsClient webSocket;
+
+// WebSocket server address
+const char* websocketServer = "ws://64.225.55.176:8765";
+
+// Low-pass filter parameter
+// 0.1 = moderate smoothing, adjust as needed
+const double ALPHA = .04;
+
+// Global filtered joint angles
+static double filtered_joint_angles[6] = {0, 0, 0, 0, 0, 0};
+
+// Function Prototypes
+void onWebSocketEvent(WebsocketsEvent event, String data);
+void websocketTask(void * pvParameters);
+void keepAliveTask(void * pvParameters);
+
+struct DHParameter {
+    double a;      // Link length
+    double alpha;  // Link twist
+    double d;      // Link offset
+    double theta;  // Joint angle (initial value, can be zero)
+};
+
+// Define the robot's DH parameters (Provided by you)
+DHParameter dh_params[6] = {
+    { 50.0,   M_PI / 2,  100.0, 0 },   // Joint 1: Base to first link
+    { 200.0,  0,         0.0,   0 },   // Joint 2: Link 1 to Link 2
+    { 150.0,  0,         0.0,   0 },   // Joint 3: Link 2 to Link 3
+    { 0.0,    M_PI / 2,  250.0, 0 },   // Joint 4: Link 3 to Link 4 (wrist)
+    { 0.0,   -M_PI / 2,  0.0,   0 },   // Joint 5: Link 4 to Link 5
+    { 0.0,    0,         50.0,  0 }    // Joint 6: Link 5 to End-Effector
+};
+
+// Function Prototypes for IK
+bool inverseKinematics(double x, double y, double z, double pitch, double yaw, double roll, double joint_angles[6]);
+void computeRotationMatrix03(double joint_angles[3], double R0_3[3][3]);
+void eulerZYXToRotationMatrix(double roll, double pitch, double yaw, double R[3][3]);
+void multiplyTransposeMatrix(double A[3][3], double B[3][3], double result[3][3]);
+void multiplyMatrices3x3(double A[3][3], double B[3][3], double result[3][3]);
+
+void onWebSocketEvent(WebsocketsEvent event, String data) {
+    if(event == WebsocketsEvent::ConnectionOpened) {
+        Serial.println("WebSocket Connection Opened");
+        // Send an initial message to identify the client
+        webSocket.send("{\"type\": \"robot\"}");
+    } 
+    else if(event == WebsocketsEvent::ConnectionClosed) {
+        Serial.println("WebSocket Connection Closed, attempting to reconnect");
+        // Attempt to reconnect
+        webSocket.connect(websocketServer);
+    } 
+    else if(event == WebsocketsEvent::GotPing) {
+        Serial.println("Received ping from server");
+        // Respond with pong
+        webSocket.send("pong");
+    } 
+    else if(event == WebsocketsEvent::GotPong) {
+        Serial.println("Received pong from server");
+    }
+}
+
+// Setup Function
+void setup() {
+    Serial.begin(115200);
+    delay(100); // Allow time for Serial Monitor to initialize
+
+    Serial.println("Connecting to Wi-Fi...");
+    WiFi.begin(ssid, password);
+
+    unsigned long wifiConnectStart = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        if (millis() - wifiConnectStart > 5000) {
+            Serial.println("\nFailed to connect to Wi-Fi, restarting...");
+            ESP.restart(); 
+        }
+        Serial.print(".");
+    }
+    Serial.println("\nConnected to Wi-Fi");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    webSocket.onEvent(onWebSocketEvent);
+
+    webSocket.onMessage([](WebsocketsMessage message) {
+        if (message.isText()) {
+            String data = message.data();
+
+            StaticJsonDocument<512> doc; 
+            DeserializationError error = deserializeJson(doc, data);
+
+            if (!error) {
+                double x = doc["position"]["x"].as<double>();
+                double y = doc["position"]["y"].as<double>();
+                double z = doc["position"]["z"].as<double>();
+
+                double pitch = doc["orientation"]["pitch"].as<double>();
+                double yaw = doc["orientation"]["yaw"].as<double>();
+                double roll = doc["orientation"]["roll"].as<double>();
+
+                // Convert orientation from degrees to radians
+                pitch = pitch * PI / 180.0;
+                yaw = yaw * PI / 180.0;
+                roll = roll * PI / 180.0;
+
+                double joint_angles[6];
+                if (inverseKinematics(x, y, z, pitch, yaw, roll, joint_angles)) {
+                    // Apply a low-pass filter to smooth the angles
+                    for (int i = 0; i < 6; ++i) {
+                        filtered_joint_angles[i] = filtered_joint_angles[i] * (1.0 - ALPHA) + joint_angles[i] * ALPHA;
+                    }
+
+                    Serial.print("Filtered Joint Angles: ");
+                    for (int i = 0; i < 6; ++i) {
+                        // Convert filtered joint angle to integer scale (0 to 4096)
+                        int angle_int = (int)(filtered_joint_angles[i] * (4096.0 / (2.0 * PI)));
+                        angle_int = (angle_int + 4096) % 4096;
+                        Serial.printf("Jnt %d: %d ", i + 1, angle_int);
+                    }
+                    Serial.println();
+                } else {
+                    // No valid solution found
+                }
+            } else {
+                Serial.print("deserializeJson() failed: ");
+                Serial.println(error.c_str());
+            }
+        } else if (message.isBinary()) {
+            Serial.print("Received Binary Message of length: ");
+            Serial.println(message.length());
+        }
+    });
+
+    bool connected = webSocket.connect(websocketServer);
+    if (connected) {
+        Serial.println("Connected to WebSocket server");
+    } else {
+        Serial.println("Failed to connect to WebSocket server, will attempt to reconnect");
+    }
+
+    xTaskCreatePinnedToCore(
+        websocketTask,
+        "WebSocketTask", 
+        10000,           
+        NULL,            
+        1,               
+        NULL,            
+        1);
+
+    xTaskCreatePinnedToCore(
+        keepAliveTask,   
+        "KeepAliveTask", 
+        10000,           
+        NULL,            
+        1,               
+        NULL,            
+        1);
+
+    vTaskDelete(NULL);
+}
+
+void loop() {
+    // Empty loop since tasks handle WebSocket communication
+}
+
+void websocketTask(void * pvParameters) {
+    while(true) {
+        webSocket.poll();
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
+void keepAliveTask(void * pvParameters) {
+    const unsigned long pingInterval = 15000; // Ping every 15 seconds
+    unsigned long previousPingMillis = millis();
+
+    while(true) {
+        unsigned long currentMillis = millis();
+        if (currentMillis - previousPingMillis >= pingInterval) {
+            previousPingMillis = currentMillis;
+            if(webSocket.available()) {
+                webSocket.send("ping");
+                Serial.println("Sent ping");
+            } else {
+                Serial.println("WebSocket not available, attempting to reconnect");
+                webSocket.connect(websocketServer);
+            }
+        }
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+}
+
+// Inverse Kinematics and Helper Functions
+bool inverseKinematics(double x, double y, double z, double pitch, double yaw, double roll, double joint_angles[6]) {
+    double d6 = dh_params[5].d; 
+
+    double R_end[3][3];
+    eulerZYXToRotationMatrix(roll, pitch, yaw, R_end);
+
+    double wx = x - d6 * R_end[0][2];
+    double wy = y - d6 * R_end[1][2];
+    double wz = z - d6 * R_end[2][2];
+
+    joint_angles[0] = atan2(wy, wx);
+
+    double a1 = dh_params[0].a;
+    double d1 = dh_params[0].d;
+    double a2 = dh_params[1].a;
+    double a3 = dh_params[2].a;
+
+    double r = sqrt(wx * wx + wy * wy) - a1; 
+    double s = wz - d1;
+
+    double D = (r * r + s * s - a2 * a2 - a3 * a3) / (2 * a2 * a3);
+
+    if (fabs(D) > 1.0) {
+        return false; 
+    }
+
+    double theta3 = atan2(-sqrt(1 - D * D), D);
+    joint_angles[2] = theta3;
+
+    double theta2 = atan2(s, r) - atan2(a3 * sin(theta3), a2 + a3 * cos(theta3));
+    joint_angles[1] = theta2;
+
+    double R0_3[3][3];
+    computeRotationMatrix03(joint_angles, R0_3);
+
+    double R3_6[3][3];
+    multiplyTransposeMatrix(R0_3, R_end, R3_6);
+
+    joint_angles[3] = atan2(R3_6[1][2], R3_6[0][2]);
+    joint_angles[4] = atan2(sqrt(R3_6[0][2]*R3_6[0][2] + R3_6[1][2]*R3_6[1][2]), R3_6[2][2]);
+    joint_angles[5] = atan2(R3_6[2][1], -R3_6[2][0]);
+
+    return true;
+}
+
+void computeRotationMatrix03(double joint_angles[3], double R0_3[3][3]) {
+    double theta1 = joint_angles[0];
+    double theta2 = joint_angles[1];
+    double theta3 = joint_angles[2];
+
+    double c1 = cos(theta1), s1 = sin(theta1);
+    double c2 = cos(theta2), s2 = sin(theta2);
+    double c3 = cos(theta3), s3 = sin(theta3);
+
+    double alpha1 = dh_params[0].alpha;
+    double alpha2 = dh_params[1].alpha;
+    double alpha3 = dh_params[2].alpha;
+
+    double R0_1[3][3] = {
+        { c1, -s1*cos(alpha1),  s1*sin(alpha1) },
+        { s1,  c1*cos(alpha1), -c1*sin(alpha1) },
+        { 0,   sin(alpha1),     cos(alpha1)    }
+    };
+
+    double R1_2[3][3] = {
+        { c2, -s2*cos(alpha2),  s2*sin(alpha2) },
+        { s2,  c2*cos(alpha2), -c2*sin(alpha2) },
+        { 0,   sin(alpha2),     cos(alpha2)    }
+    };
+
+    double R2_3[3][3] = {
+        { c3, -s3*cos(alpha3),  s3*sin(alpha3) },
+        { s3,  c3*cos(alpha3), -c3*sin(alpha3) },
+        { 0,   sin(alpha3),     cos(alpha3)    }
+    };
+
+    double R0_2[3][3];
+    multiplyMatrices3x3(R0_1, R1_2, R0_2);
+    multiplyMatrices3x3(R0_2, R2_3, R0_3);
+}
+
+void eulerZYXToRotationMatrix(double roll, double pitch, double yaw, double R[3][3]) {
+    double cr = cos(roll);
+    double sr = sin(roll);
+    double cp = cos(pitch);
+    double sp = sin(pitch);
+    double cy = cos(yaw);
+    double sy = sin(yaw);
+
+    R[0][0] = cy * cp;
+    R[0][1] = cy * sp * sr - sy * cr;
+    R[0][2] = cy * sp * cr + sy * sr;
+
+    R[1][0] = sy * cp;
+    R[1][1] = sy * sp * sr + cy * cr;
+    R[1][2] = sy * sp * cr - cy * sr;
+
+    R[2][0] = -sp;
+    R[2][1] = cp * sr;
+    R[2][2] = cp * cr;
+}
+
+void multiplyTransposeMatrix(double A[3][3], double B[3][3], double result[3][3]) {
+    double At[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            At[i][j] = A[j][i];
+
+    multiplyMatrices3x3(At, B, result);
+}
+
+void multiplyMatrices3x3(double A[3][3], double B[3][3], double result[3][3]) {
+    for(int i = 0; i < 3; ++i) {
+        for(int j = 0; j < 3; ++j) {
+            result[i][j] = 0;
+            for(int k = 0; k < 3; ++k)
+                result[i][j] += A[i][k] * B[k][j];
+        }
+    }
+}

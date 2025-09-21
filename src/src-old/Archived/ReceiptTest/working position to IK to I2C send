@@ -1,0 +1,431 @@
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <ArduinoWebsockets.h>
+#include <Wire.h> // Include the Wire library for I2C communication
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+
+using namespace websockets;
+
+// Replace with your Wi-Fi credentials
+const char* ssid = "The Best Is Yet To Come!";
+const char* password = "blessings1";
+
+// WebSocket client instance
+WebsocketsClient webSocket;
+
+// WebSocket server address
+const char* websocketServer = "ws://64.225.55.176:8765";
+
+// I2C Slave Address (choose an address between 0x08 and 0x77)
+#define SLAVE_ADDR 0x08
+
+// Queue handle
+QueueHandle_t jointAnglesQueue;
+
+// Function Prototypes
+void onWebSocketEvent(WebsocketsEvent event, String data);
+void websocketTask(void* pvParameters);
+void keepAliveTask(void* pvParameters);
+void i2cTransmissionTask(void* pvParameters);
+
+// Structure to hold DH parameters
+struct DHParameter {
+    double a;      // Link length
+    double alpha;  // Link twist
+    double d;      // Link offset
+    double theta;  // Joint angle (initial value, can be zero)
+};
+
+// Define the robot's DH parameters (Provided by you)
+DHParameter dh_params[6] = {
+    {50.0,   M_PI / 2,  100.0, 0},   // Joint 1: Base to first link
+    {200.0,  0,         0.0,   0},   // Joint 2: Link 1 to Link 2
+    {150.0,  0,         0.0,   0},   // Joint 3: Link 2 to Link 3
+    {0.0,    M_PI / 2,  250.0, 0},   // Joint 4: Link 3 to Link 4 (wrist)
+    {0.0,   -M_PI / 2,  0.0,   0},   // Joint 5: Link 4 to Link 5
+    {0.0,    0,         50.0,  0}    // Joint 6: Link 5 to End-Effector
+};
+
+// Function Prototypes for IK
+bool inverseKinematics(double x, double y, double z, double pitch, double yaw, double roll, double joint_angles[6]);
+void computeRotationMatrix03(double joint_angles[3], double R0_3[3][3]);
+void eulerZYXToRotationMatrix(double roll, double pitch, double yaw, double R[3][3]);
+void multiplyTransposeMatrix(double A[3][3], double B[3][3], double result[3][3]);
+void multiplyMatrices3x3(double A[3][3], double B[3][3], double result[3][3]);
+
+// WebSocket Event Handler
+void onWebSocketEvent(WebsocketsEvent event, String data) {
+    if (event == WebsocketsEvent::ConnectionOpened) {
+        Serial.println("WebSocket Connection Opened");
+        // Send an initial message to identify the client
+        webSocket.send("{\"type\": \"robot\"}");
+    } else if (event == WebsocketsEvent::ConnectionClosed) {
+        Serial.println("WebSocket Connection Closed, attempting to reconnect");
+        // Attempt to reconnect
+        webSocket.connect(websocketServer);
+    } else if (event == WebsocketsEvent::GotPing) {
+        Serial.println("Received ping from server");
+        // Respond with pong
+        webSocket.send("pong");
+    } else if (event == WebsocketsEvent::GotPong) {
+        Serial.println("Received pong from server");
+    }
+    // Optionally handle other events
+}
+
+// Setup Function
+void setup() {
+    Serial.begin(115200);
+    delay(1000); // Allow time for Serial Monitor to initialize
+
+    // Initialize I2C communication
+    Wire.begin(); // Uses default SDA and SCL pins (GPIO21 and GPIO22 on ESP32)
+
+    // Create a queue capable of holding 10 sets of joint angles
+    jointAnglesQueue = xQueueCreate(10, sizeof(int) * 6);
+    if (jointAnglesQueue == NULL) {
+        Serial.println("Error creating the joint angles queue");
+        while (1); // Halt execution
+    }
+
+    // Connect to Wi-Fi
+    Serial.println("Connecting to Wi-Fi...");
+    WiFi.begin(ssid, password);
+
+    // Non-blocking Wi-Fi connection with timeout
+    unsigned long wifiConnectStart = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        if (millis() - wifiConnectStart > 20000) { // Timeout after 20 seconds
+            Serial.println("\nFailed to connect to Wi-Fi, restarting...");
+            ESP.restart(); // Restart and retry
+        }
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nConnected to Wi-Fi");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    // Set WebSocket event handler
+    webSocket.onEvent(onWebSocketEvent);
+
+    // Set WebSocket message handler
+    webSocket.onMessage([](WebsocketsMessage message) {
+        if (message.isText()) {
+            String data = message.data();
+            // Parse JSON data
+            StaticJsonDocument<512> doc; // Adjust size as needed
+            DeserializationError error = deserializeJson(doc, data);
+
+            if (!error) {
+                // Extract position
+                double x = doc["position"]["x"].as<double>();
+                double y = doc["position"]["y"].as<double>();
+                double z = doc["position"]["z"].as<double>();
+
+                // Extract orientation (assuming pitch, yaw, roll in degrees)
+                double pitch = doc["orientation"]["pitch"].as<double>();
+                double yaw = doc["orientation"]["yaw"].as<double>();
+                double roll = doc["orientation"]["roll"].as<double>();
+
+                // Convert orientation from degrees to radians
+                pitch = pitch * PI / 180.0;
+                yaw = yaw * PI / 180.0;
+                roll = roll * PI / 180.0;
+
+                // Compute joint angles
+                double joint_angles[6];
+                if (inverseKinematics(x, y, z, pitch, yaw, roll, joint_angles)) {
+                    Serial.print("Computed Joint Angles: ");
+                    int angle_ints[6];
+                    for (int i = 0; i < 6; ++i) {
+                        // Convert joint angle from radians to integer scale (0 to 4096)
+                        int angle_int = (int)(joint_angles[i] * (4096.0 / (2.0 * PI)));
+                        // Ensure the angle is within 0 to 4095
+                        angle_int = (angle_int + 4096) % 4096;
+                        angle_ints[i] = angle_int;
+                        Serial.printf("Jnt %d: %d ", i + 1, angle_int);
+                    }
+                    Serial.println(); // Move to the next line after printing all joint angles
+
+                    // Send joint angles to the queue
+                    if (xQueueSend(jointAnglesQueue, angle_ints, portMAX_DELAY) != pdPASS) {
+                        Serial.println("Failed to send joint angles to queue");
+                    }
+
+                } else {
+                    Serial.println("Inverse kinematics calculation failed. No valid solution found.");
+                }
+            } else {
+                Serial.print("deserializeJson() failed: ");
+                Serial.println(error.c_str());
+            }
+        } else if (message.isBinary()) {
+            Serial.print("Received Binary Message of length: ");
+            Serial.println(message.length());
+            // Handle binary messages if necessary
+        }
+    });
+
+    // Connect to WebSocket server
+    bool connected = webSocket.connect(websocketServer);
+    if (connected) {
+        Serial.println("Connected to WebSocket server");
+    } else {
+        Serial.println("Failed to connect to WebSocket server, will attempt to reconnect");
+    }
+
+    // Create a task for handling WebSocket communication
+    xTaskCreatePinnedToCore(
+        websocketTask,   // Function to implement the task
+        "WebSocketTask", // Name of the task
+        10000,           // Stack size in words
+        NULL,            // Task input parameter
+        1,               // Priority of the task
+        NULL,            // Task handle
+        1);              // Core where the task should run (1 or 0)
+
+    // Create a task for keep-alive pings
+    xTaskCreatePinnedToCore(
+        keepAliveTask,   // Function to implement the task
+        "KeepAliveTask", // Name of the task
+        10000,           // Stack size in words
+        NULL,            // Task input parameter
+        1,               // Priority of the task
+        NULL,            // Task handle
+        1);              // Core where the task should run (1 or 0)
+
+    // Create a task for I2C transmission
+    xTaskCreatePinnedToCore(
+        i2cTransmissionTask, // Function to implement the task
+        "I2CTransmissionTask", // Name of the task
+        10000,              // Stack size in words
+        NULL,               // Task input parameter
+        1,                  // Priority of the task
+        NULL,               // Task handle
+        1);                 // Core where the task should run (1 or 0)
+
+    // Optionally, delete the setup task if no loop() is used
+    vTaskDelete(NULL);
+}
+
+// Loop Function (Empty because tasks handle everything)
+void loop() {
+    // Empty loop since tasks handle WebSocket communication
+}
+
+// Task to handle WebSocket communication
+void websocketTask(void* pvParameters) {
+    while (true) {
+        webSocket.poll(); // Process WebSocket events
+
+        vTaskDelay(10 / portTICK_PERIOD_MS); // Delay 10ms to allow other tasks to run
+    }
+}
+
+// Task to send keep-alive pings
+void keepAliveTask(void* pvParameters) {
+    const unsigned long pingInterval = 15000; // Ping every 15 seconds
+    unsigned long previousPingMillis = millis();
+
+    while (true) {
+        unsigned long currentMillis = millis();
+        if (currentMillis - previousPingMillis >= pingInterval) {
+            previousPingMillis = currentMillis;
+            if (webSocket.available()) {
+                webSocket.send("ping");
+                Serial.println("Sent ping");
+            } else {
+                Serial.println("WebSocket not available, attempting to reconnect");
+                webSocket.connect(websocketServer);
+            }
+        }
+        vTaskDelay(1000 / portTICK_PERIOD_MS); // Delay 1 second
+    }
+}
+
+// Task to handle I2C transmission
+void i2cTransmissionTask(void* pvParameters) {
+    int angle_ints[6]; // Array to hold joint angles
+
+    while (true) {
+        // Wait for joint angles to be available in the queue
+        if (xQueueReceive(jointAnglesQueue, angle_ints, portMAX_DELAY) == pdPASS) {
+            // Prepare data for I2C transmission
+            byte i2cData[12]; // 6 joint angles * 2 bytes each
+            for (int i = 0; i < 6; ++i) {
+                int angle = angle_ints[i]; // Should be between 0 and 4095
+                byte highByte = (angle >> 8) & 0x0F; // Upper 4 bits (bits 8-11)
+                byte lowByte = angle & 0xFF;         // Lower 8 bits (bits 0-7)
+                i2cData[2 * i] = highByte;
+                i2cData[2 * i + 1] = lowByte;
+            }
+
+            // Transmit the data over I2C
+            Wire.beginTransmission(SLAVE_ADDR);
+            int bytesWritten = Wire.write(i2cData, 12);
+            byte error = Wire.endTransmission();
+
+            if (error == 0) {
+                Serial.println("Joint angles transmitted over I2C.");
+            } else {
+                Serial.print("I2C transmission error: ");
+                Serial.println(error);
+            }
+
+            // Optional: Add a delay if necessary
+            // vTaskDelay(10 / portTICK_PERIOD_MS);
+        }
+    }
+}
+
+// Implement the inverse kinematics and helper functions here
+
+// Function to compute inverse kinematics
+bool inverseKinematics(double x, double y, double z, double pitch, double yaw, double roll, double joint_angles[6]) {
+    // Adjust the function based on the provided DH parameters
+    // Compute the wrist center position
+    double d6 = dh_params[5].d; // End-effector offset along Z6
+
+    // Compute rotation matrix from end-effector orientation
+    double R_end[3][3];
+    eulerZYXToRotationMatrix(roll, pitch, yaw, R_end);
+
+    // Compute wrist center position (Px, Py, Pz)
+    double wx = x - d6 * R_end[0][2];
+    double wy = y - d6 * R_end[1][2];
+    double wz = z - d6 * R_end[2][2];
+
+    // Solve for theta1
+    joint_angles[0] = atan2(wy, wx);
+
+    // Compute variables for theta2 and theta3
+    double a1 = dh_params[0].a;
+    double d1 = dh_params[0].d;
+    double a2 = dh_params[1].a;
+    double a3 = dh_params[2].a;
+
+    // Calculate the distances
+    double r = sqrt(wx * wx + wy * wy) - a1; // Adjusted for a1
+    double s = wz - d1;
+
+    // Compute D for theta3
+    double D = (r * r + s * s - a2 * a2 - a3 * a3) / (2 * a2 * a3);
+
+    // Check if D is within valid range
+    if (fabs(D) > 1.0) {
+        // Serial.println("No valid solution for theta3");
+        return false; // No solution
+    }
+
+    // Solve for theta3
+    double theta3 = atan2(-sqrt(1 - D * D), D);
+    joint_angles[2] = theta3;
+
+    // Solve for theta2
+    double theta2 = atan2(s, r) - atan2(a3 * sin(theta3), a2 + a3 * cos(theta3));
+    joint_angles[1] = theta2;
+
+    // Compute rotation matrix R0_3
+    double R0_3[3][3];
+    computeRotationMatrix03(joint_angles, R0_3);
+
+    // Compute R3_6
+    double R3_6[3][3];
+    multiplyTransposeMatrix(R0_3, R_end, R3_6);
+
+    // Solve for theta4, theta5, theta6
+    joint_angles[3] = atan2(R3_6[1][2], R3_6[0][2]);
+    joint_angles[4] = atan2(sqrt(R3_6[0][2] * R3_6[0][2] + R3_6[1][2] * R3_6[1][2]), R3_6[2][2]);
+    joint_angles[5] = atan2(R3_6[2][1], -R3_6[2][0]);
+
+    return true;
+}
+
+// Function to compute rotation matrix R0_3 based on first three joint angles
+void computeRotationMatrix03(double joint_angles[3], double R0_3[3][3]) {
+    double theta1 = joint_angles[0];
+    double theta2 = joint_angles[1];
+    double theta3 = joint_angles[2];
+
+    // Compute individual transformation matrices
+    double c1 = cos(theta1), s1 = sin(theta1);
+    double c2 = cos(theta2), s2 = sin(theta2);
+    double c3 = cos(theta3), s3 = sin(theta3);
+
+    // DH Parameters for joints 1-3
+    double alpha1 = dh_params[0].alpha;
+    double alpha2 = dh_params[1].alpha;
+    double alpha3 = dh_params[2].alpha;
+
+    // Compute rotation matrices
+    double R0_1[3][3] = {
+        {c1, -s1 * cos(alpha1),  s1 * sin(alpha1)},
+        {s1,  c1 * cos(alpha1), -c1 * sin(alpha1)},
+        { 0,           sin(alpha1),          cos(alpha1)}
+    };
+
+    double R1_2[3][3] = {
+        {c2, -s2 * cos(alpha2),  s2 * sin(alpha2)},
+        {s2,  c2 * cos(alpha2), -c2 * sin(alpha2)},
+        { 0,           sin(alpha2),          cos(alpha2)}
+    };
+
+    double R2_3[3][3] = {
+        {c3, -s3 * cos(alpha3),  s3 * sin(alpha3)},
+        {s3,  c3 * cos(alpha3), -c3 * sin(alpha3)},
+        { 0,           sin(alpha3),          cos(alpha3)}
+    };
+
+    // Multiply R0_3 = R0_1 * R1_2 * R2_3
+    double R0_2[3][3];
+    multiplyMatrices3x3(R0_1, R1_2, R0_2);
+    multiplyMatrices3x3(R0_2, R2_3, R0_3);
+}
+
+// Function to convert Euler angles (ZYX) to rotation matrix
+void eulerZYXToRotationMatrix(double roll, double pitch, double yaw, double R[3][3]) {
+    double cr = cos(roll);
+    double sr = sin(roll);
+    double cp = cos(pitch);
+    double sp = sin(pitch);
+    double cy = cos(yaw);
+    double sy = sin(yaw);
+
+    R[0][0] = cy * cp;
+    R[0][1] = cy * sp * sr - sy * cr;
+    R[0][2] = cy * sp * cr + sy * sr;
+
+    R[1][0] = sy * cp;
+    R[1][1] = sy * sp * sr + cy * cr;
+    R[1][2] = sy * sp * cr - cy * sr;
+
+    R[2][0] = -sp;
+    R[2][1] = cp * sr;
+    R[2][2] = cp * cr;
+}
+
+// Function to multiply two 3x3 matrices: result = A^T * B
+void multiplyTransposeMatrix(double A[3][3], double B[3][3], double result[3][3]) {
+    // Compute A^T
+    double At[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            At[i][j] = A[j][i];
+
+    // Multiply At * B
+    multiplyMatrices3x3(At, B, result);
+}
+
+// Function to multiply two 3x3 matrices
+void multiplyMatrices3x3(double A[3][3], double B[3][3], double result[3][3]) {
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            result[i][j] = 0;
+            for (int k = 0; k < 3; ++k)
+                result[i][j] += A[i][k] * B[k][j];
+        }
+    }
+}

@@ -1,0 +1,109 @@
+#include <Arduino.h>
+#include <SPI.h>
+
+//-- ⚙️ Pin Definitions from your Schematic --//
+const int SPI_CS_PIN = 4;   // Chip Select connected to GPIO 4
+const int SPI_SCK_PIN = 12;  // Clock connected to GPIO 12
+const int SPI_MISO_PIN = 13; // MISO connected to GPIO 13
+const int SPI_MOSI_PIN = 14; // MOSI connected to GPIO 14
+
+//-- AS5047P Register and Command Definitions --//
+const uint16_t REG_ANGLEUNC = 0x3FFE; // Address of the uncorrected angle register
+const uint16_t REG_NOP = 0x0000;      // No-operation register address
+const uint16_t CMD_READ_FLAG = 0x4000; // Bit 14 is 1 for a read command
+
+// SPI settings for the AS5047P
+// Max frequency is 10MHz, Mode 1 (CPOL=0, CPHA=1)
+SPISettings settings(1000000, MSBFIRST, SPI_MODE1);
+
+/**
+ * @brief Calculates the even parity for a 16-bit word.
+ * The AS5047P requires this in the MSB of the command frame.
+ * @param value The 16-bit command word (without the parity bit).
+ * @return 1 if parity is odd, 0 if parity is even.
+ */
+uint8_t calculateEvenParity(uint16_t value) {
+  uint8_t count = 0;
+  for (int i = 0; i < 16; i++) {
+    if (value & 0x01) {
+      count++;
+    }
+    value >>= 1;
+  }
+  return count % 2;
+}
+
+/**
+ * @brief Reads the raw 14-bit angle from the AS5047P sensor.
+ * @return The raw angle value (0-16383).
+ */
+uint16_t readAngle() {
+  // The AS5047P requires a two-step SPI transaction to read data.
+  // 1. Send the command to read a register.
+  // 2. Send a NOP (No-Op) command. The data returned during this second
+  //    transaction is the result from the first command.
+
+  uint16_t command;
+  uint16_t receivedData;
+
+  // --- Transaction 1: Send the read command for the angle register ---
+  command = CMD_READ_FLAG | REG_ANGLEUNC;
+  if (calculateEvenParity(command)) {
+    command |= 0x8000; // Set parity bit if needed
+  }
+
+  SPI.beginTransaction(settings);
+  digitalWrite(SPI_CS_PIN, LOW);
+  SPI.transfer16(command); // Send command, ignore received data
+  digitalWrite(SPI_CS_PIN, HIGH);
+  SPI.endTransaction();
+
+  // A very short delay is good practice between transactions
+  delayMicroseconds(1);
+
+  // --- Transaction 2: Send NOP to get the result from the first command ---
+  command = CMD_READ_FLAG | REG_NOP;
+  if (calculateEvenParity(command)) {
+    command |= 0x8000; // Set parity bit if needed
+  }
+  
+  SPI.beginTransaction(settings);
+  digitalWrite(SPI_CS_PIN, LOW);
+  receivedData = SPI.transfer16(command); // Data from ANGLEUNC is received here
+  digitalWrite(SPI_CS_PIN, HIGH);
+  SPI.endTransaction();
+
+  // The angle is in the lower 14 bits of the received data.
+  // We mask it to remove any potential error flags.
+  return receivedData & 0x3FFF;
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial); // Wait for Serial Monitor to connect
+  Serial.println("AS5047P SPI Reader Initialized");
+
+  // Set up the custom Chip Select pin
+  pinMode(SPI_CS_PIN, OUTPUT);
+  digitalWrite(SPI_CS_PIN, HIGH);
+
+  // Initialize the SPI bus with our custom pins
+  SPI.begin(SPI_SCK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN);
+  
+  Serial.println("Reading angle...");
+}
+
+
+void loop() {
+  // Read the raw angle value (0-16383)
+  uint16_t rawAngle = readAngle();
+
+  // Convert the raw value to degrees
+  float degrees = rawAngle * (360.0 / 16384.0);
+
+  // Print the results
+  Serial.printf("Raw Value: %-5u | Degrees: %.2f\n", rawAngle, degrees);
+  
+  delay(100); // Read 10 times per second
+}

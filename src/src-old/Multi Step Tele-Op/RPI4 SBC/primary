@@ -1,0 +1,263 @@
+import asyncio
+import json
+import cv2
+import websockets
+import argparse
+import numpy as np
+import sys
+import serial  # Ensure this is the pyserial module
+from aiortc import (
+    RTCPeerConnection,
+    RTCSessionDescription,
+    VideoStreamTrack,
+    RTCIceCandidate
+)
+from aiortc.contrib.media import MediaPlayer
+from av import VideoFrame
+
+DEBUG_LOOP = False
+
+class DualCameraVideoTrack(VideoStreamTrack):
+    """
+    Video track that captures from two webcams.
+    The main feed (camera 2) is used as the base and a reduced-resolution
+    version of camera 1 is overlaid in the top right corner.
+    """
+    def __init__(self, frame_rate=30):
+        super().__init__()
+        self.frame_rate = frame_rate
+        self.frame_period = 1.0 / frame_rate
+        self.frame_count = 0
+        self.start = asyncio.get_event_loop().time()
+
+        # Open first and second webcams.
+        self.cap1 = cv2.VideoCapture(0, cv2.CAP_V4L2)
+        self.cap2 = cv2.VideoCapture(2, cv2.CAP_V4L2)
+
+        for cap in [self.cap1, self.cap2]:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, frame_rate)
+
+        if not self.cap1.isOpened():
+            print("DEBUG: Camera 1 failed to open!")
+        else:
+            print("DEBUG: Camera 1 opened successfully.")
+        if not self.cap2.isOpened():
+            print("DEBUG: Camera 2 failed to open!")
+        else:
+            print("DEBUG: Camera 2 opened successfully.")
+
+    async def next_timestamp(self):
+        self.frame_count += 1
+        pts = int(self.frame_count * (90000 / self.frame_rate))
+        now = asyncio.get_event_loop().time()
+        expected_time = self.start + self.frame_count * self.frame_period
+        delay = expected_time - now
+        if delay > 0:
+            await asyncio.sleep(delay)
+        return pts, 90000
+
+    async def recv(self):
+        pts, time_base = await self.next_timestamp()
+
+        # Grab latest frames.
+        self.cap1.grab()
+        self.cap2.grab()
+        ret1, frame1 = self.cap1.read()
+        ret2, frame2 = self.cap2.read()
+
+        if not ret1 or not ret2:
+            raise Exception("DEBUG: Failed to read frame from one or both webcams")
+        
+        # Picture-in-picture: overlay scaled camera 1 on camera 2.
+        composite_frame = frame2.copy()
+        main_h, main_w = composite_frame.shape[:2]
+        overlay_w = main_w // 3
+        overlay_h = int(overlay_w * 480 / 640)
+        frame1_small = cv2.resize(frame1, (overlay_w, overlay_h))
+        x_offset = main_w - overlay_w
+        y_offset = 0
+        composite_frame[y_offset:y_offset+overlay_h, x_offset:x_offset+overlay_w] = frame1_small
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print("DEBUG: 'q' pressed, releasing cameras and exiting.")
+            self.close()
+
+        video_frame = VideoFrame.from_ndarray(composite_frame, format="bgr24")
+        video_frame.pts = pts
+        video_frame.time_base = time_base
+        return video_frame
+
+    def close(self):
+        if self.cap1 is not None and self.cap1.isOpened():
+            self.cap1.release()
+        if self.cap2 is not None and self.cap2.isOpened():
+            self.cap2.release()
+        cv2.destroyAllWindows()
+        print("DEBUG: Cameras and windows released.")
+
+async def debug_loop(track):
+    print("DEBUG: Starting debug loop for DualCameraVideoTrack")
+    while True:
+        try:
+            frame = await track.recv()
+            print("DEBUG: Debug loop received frame with pts:", frame.pts)
+            await asyncio.sleep(0.03)
+        except Exception as e:
+            print("DEBUG: Exception in debug loop:", e)
+            break
+
+async def send_control_messages(ws):
+    loop = asyncio.get_event_loop()
+    while True:
+        cmd = await loop.run_in_executor(None, input, "Enter control command (up, down, left, right): ")
+        cmd = cmd.strip().lower()
+        if cmd in ["up", "down", "left", "right"]:
+            payload = json.dumps({"type": "control", "direction": cmd})
+            await ws.send(payload)
+            print("DEBUG: Sent control message:", payload)
+        else:
+            print("DEBUG: Unknown command, please try again.")
+
+async def create_peer_connection(ws, frame_rate):
+    """
+    Create a new RTCPeerConnection, register event handlers, and add media tracks.
+    """
+    pc = RTCPeerConnection()
+
+    @pc.on("icecandidate")
+    async def on_icecandidate(e):
+        candidate = e.candidate
+        if candidate is not None:
+            msg = json.dumps({
+                "type": "candidate",
+                "candidate": candidate.to_json()
+            })
+            await ws.send(msg)
+            print("DEBUG: Sent ICE candidate:", msg)
+
+    # Add video track.
+    video_track = DualCameraVideoTrack(frame_rate=frame_rate)
+    pc.addTrack(video_track)
+
+    # Add audio track.
+    try:
+        audio_player = MediaPlayer("default", format="alsa")
+        if audio_player.audio:
+            pc.addTrack(audio_player.audio)
+            print("DEBUG: Added audio track from MediaPlayer")
+        else:
+            print("DEBUG: No audio track available from MediaPlayer")
+    except Exception as e:
+        print("DEBUG: Audio capture error:", e)
+
+    return pc, video_track
+
+async def run(signaling_uri, frame_rate):
+    uart_port = '/dev/serial0'
+    uart_baud = 115200
+    try:
+        uart = serial.Serial(uart_port, baudrate=uart_baud, timeout=1)
+        print("DEBUG: UART connected on", uart_port)
+    except Exception as e:
+        print("DEBUG: Failed to open UART on", uart_port, ":", e)
+        return
+
+    try:
+        print("DEBUG: Connecting to:", signaling_uri)
+        async with websockets.connect(signaling_uri) as ws:
+            print("DEBUG: Connected to signaling server")
+            # Create the initial RTCPeerConnection.
+            pc, video_track = await create_peer_connection(ws, frame_rate)
+            
+            # Send initial offer.
+            offer = await pc.createOffer()
+            await pc.setLocalDescription(offer)
+            offer_msg = json.dumps({"type": "offer", "sdp": pc.localDescription.sdp})
+            print("DEBUG: Sending initial offer to server")
+            await ws.send(offer_msg)
+            print("DEBUG: Initial offer sent")
+
+            asyncio.create_task(send_control_messages(ws))
+
+            async for msg in ws:
+                print("DEBUG: Received from server:", msg)
+                data = json.loads(msg)
+                if data["type"] == "answer":
+                    answer = RTCSessionDescription(sdp=data["sdp"], type=data["type"])
+                    await pc.setRemoteDescription(answer)
+                    print("DEBUG: Answer received and set")
+                elif data["type"] == "candidate":
+                    candidate_data = data["candidate"]
+                    candidate_string = candidate_data["candidate"]
+                    parts = candidate_string.split()
+                    if parts and parts[0].startswith("candidate:"):
+                        foundation_part = parts[0].split("candidate:")[1]
+                        candidate_parts = [foundation_part] + parts[1:]
+                        foundation = candidate_parts[0]
+                        component = candidate_parts[1]
+                        protocol = candidate_parts[2]
+                        priority = int(candidate_parts[3])
+                        ip = candidate_parts[4]
+                        port = int(candidate_parts[5])
+                        candidate_type = candidate_parts[7]
+                        ice_candidate = RTCIceCandidate(
+                            foundation=foundation,
+                            component=int(component),
+                            protocol=protocol,
+                            priority=priority,
+                            ip=ip,
+                            port=port,
+                            type=candidate_type,
+                            sdpMid=candidate_data["sdpMid"],
+                            sdpMLineIndex=candidate_data["sdpMLineIndex"]
+                        )
+                        await pc.addIceCandidate(ice_candidate)
+                        print("DEBUG: Added ICE candidate from remote")
+                    else:
+                        print("DEBUG: Unexpected candidate format:", candidate_string)
+                elif data["type"] == "control":
+                    control_msg = data.get("controlString") or data.get("direction")
+                    print("DEBUG: Received control message:", control_msg)
+                    if control_msg is not None:
+                        uart.write((control_msg + "\n").encode('utf-8'))
+                        print("DEBUG: Sent control message via UART:", control_msg)
+                elif data["type"] == "new_offer_request":
+                    # Reinitialize the RTCPeerConnection completely.
+                    print("DEBUG: Received new_offer_request from server. Reinitializing RTCPeerConnection.")
+                    try:
+                        video_track.close()  # Release the camera resources.
+                    except Exception as e:
+                        print("DEBUG: Error closing video track:", e)
+                    await pc.close()
+                    # Wait briefly to let camera resources free up.
+                    await asyncio.sleep(0.5)
+                    pc, video_track = await create_peer_connection(ws, frame_rate)
+                    new_offer = await pc.createOffer()
+                    await pc.setLocalDescription(new_offer)
+                    offer_msg = json.dumps({"type": "offer", "sdp": pc.localDescription.sdp})
+                    await ws.send(offer_msg)
+                    print("DEBUG: New offer sent to server after reinitialization.")
+
+            await asyncio.Future()  # Keep connection open
+    finally:
+        await pc.close()
+        uart.close()
+        print("DEBUG: Peer connection and UART closed.")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="WebRTC dual camera streaming with adjustable frame rate and UART control"
+    )
+    parser.add_argument("--framerate", type=float, default=15, help="Frame rate for capturing video")
+    args = parser.parse_args()
+
+    signaling_uri = "ws://64.225.55.176:8080"  # Adjust if needed
+
+    try:
+        asyncio.run(run(signaling_uri, args.framerate))
+    except KeyboardInterrupt:
+        print("\nDEBUG: Received Ctrl-C, exiting gracefully...")
+        cv2.destroyAllWindows()
+        sys.exit(0)

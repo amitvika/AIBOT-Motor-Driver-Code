@@ -1,0 +1,209 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <SimpleFOC.h>
+
+// ==========================================================================
+// Custom Sensor Class (Corrected)
+// ==========================================================================
+class MyAS5047PSensor : public Sensor {
+public:
+  MyAS5047PSensor() : spi_settings(10000000, MSBFIRST, SPI_MODE1) {}
+  void init() override {
+    pinMode(4, OUTPUT);
+    digitalWrite(4, HIGH);
+    SPI.begin(12, 13, 14);
+  }
+  float getSensorAngle() override {
+    uint16_t raw_angle = readRawAngle();
+    return (float)raw_angle * (_2PI / 16384.0f);
+  }
+private:
+  // The full function definitions are now correctly placed inside the class
+  uint16_t readRawAngle() {
+    const uint16_t REG_ANGLEUNC = 0x3FFE, REG_NOP = 0x0000, CMD_READ_FLAG = 0x4000;
+    uint16_t command = CMD_READ_FLAG | REG_ANGLEUNC;
+    if (calculateEvenParity(command)) command |= 0x8000;
+    SPI.beginTransaction(spi_settings);
+    digitalWrite(4, LOW);
+    SPI.transfer16(command);
+    digitalWrite(4, HIGH);
+    SPI.endTransaction();
+    delayMicroseconds(1);
+    command = CMD_READ_FLAG | REG_NOP;
+    if (calculateEvenParity(command)) command |= 0x8000;
+    SPI.beginTransaction(spi_settings);
+    digitalWrite(4, LOW);
+    uint16_t receivedData = SPI.transfer16(command);
+    digitalWrite(4, HIGH);
+    SPI.endTransaction();
+    return receivedData & 0x3FFF;
+  }
+  uint8_t calculateEvenParity(uint16_t value) {
+    uint8_t count = 0;
+    for (int i = 0; i < 16; i++) {
+      if (value & 0x01) count++;
+      value >>= 1;
+    }
+    return count % 2;
+  }
+  SPISettings spi_settings;
+};
+
+// ==========================================================================
+// Main FOC Application
+// ==========================================================================
+
+// Motor and driver parameters
+const int POLE_PAIRS = 50;
+StepperMotor motor(POLE_PAIRS);
+StepperDriver4PWM driver(37, 38, 39, 40);
+MyAS5047PSensor sensor;
+
+// --- Two-Phase Tuner Configuration ---
+enum TuningState { COARSE_SEARCH, FINE_TUNE_INIT, FINE_TUNE_ASCENDING, TUNING_COMPLETE, IDLE };
+TuningState currentState = IDLE;
+
+// Phase 1: Coarse Scan settings
+const float COARSE_RANGE = 1.0f; // Scan +/- 1.0 radians from the base angle
+const float COARSE_STEP = 0.1f;  // Use a large step size
+int coarse_step_index = 0;
+int total_coarse_steps = (int)((COARSE_RANGE * 2) / COARSE_STEP) + 1;
+float base_angle = 0.0f;
+
+// Phase 2: Fine Tuning settings
+const float FINE_STEP = 0.01f; // Use a small step for precision
+float step_direction = FINE_STEP;
+int reversals = 0;
+
+// Shared variables
+float best_angle = 0.0f;
+float best_rpm = 0.0f;
+
+// Averaging variables
+const unsigned long STABILIZE_TIME = 1500;
+const unsigned long SAMPLE_TIME = 1500;
+const unsigned long SAMPLE_INTERVAL = 20;
+unsigned long last_step_time = 0;
+unsigned long last_sample_time = 0;
+float rpm_sum = 0.0f;
+int sample_count = 0;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Stepper FOC - Robust Two-Phase Auto-Tuner");
+  sensor.init();
+  motor.linkSensor(&sensor);
+  driver.voltage_power_supply = 25.0;
+  driver.voltage_limit = 6.0;
+  driver.init();
+  motor.linkDriver(&driver);
+  motor.torque_controller = TorqueControlType::voltage;
+  motor.controller = MotionControlType::torque;
+  motor.PID_velocity.I = 0.0f;
+  motor.voltage_limit = 6.0;
+  motor.voltage_sensor_align = 6.0;
+  motor.init();
+  motor.initFOC();
+
+  Serial.println("\n--- Initial Alignment Found ---");
+  base_angle = motor.zero_electric_angle;
+  best_angle = base_angle;
+  Serial.print("Base Angle: "); Serial.println(base_angle, 4);
+  Serial.println(F("\n--- Phase 1: Starting Coarse Scan ---"));
+  
+  last_step_time = millis();
+  currentState = COARSE_SEARCH;
+}
+
+void loop() {
+  motor.loopFOC();
+
+  switch (currentState) {
+    case COARSE_SEARCH: {
+      motor.move(6.0);
+      if ((millis() - last_step_time > STABILIZE_TIME) && (millis() - last_sample_time > SAMPLE_INTERVAL)) {
+        rpm_sum += motor.shaft_velocity * 9.5493f;
+        sample_count++;
+        last_sample_time = millis();
+      }
+      if (millis() - last_step_time > (STABILIZE_TIME + SAMPLE_TIME)) {
+        float avg_rpm = (sample_count > 0) ? (rpm_sum / sample_count) : 0;
+        Serial.print("Coarse Step "); Serial.print(coarse_step_index + 1); Serial.print("/"); Serial.print(total_coarse_steps);
+        Serial.print(": Angle "); Serial.print(motor.zero_electric_angle, 4);
+        Serial.print(" -> Avg RPM: "); Serial.println(avg_rpm);
+        if (avg_rpm > best_rpm) {
+          best_rpm = avg_rpm;
+          best_angle = motor.zero_electric_angle;
+        }
+        coarse_step_index++;
+        if (coarse_step_index >= total_coarse_steps) {
+          currentState = FINE_TUNE_INIT;
+        } else {
+          float next_angle = (base_angle - COARSE_RANGE) + (coarse_step_index * COARSE_STEP);
+          motor.zero_electric_angle = next_angle;
+          last_step_time = millis();
+          rpm_sum = 0.0f;
+          sample_count = 0;
+        }
+      }
+      break;
+    }
+    case FINE_TUNE_INIT: {
+      Serial.println("\n--- Phase 2: Starting Fine Tune ---");
+      Serial.print("Best region found near: "); Serial.println(best_angle, 4);
+      Serial.println("Honing in on the precise peak...");
+      motor.zero_electric_angle = best_angle;
+      last_step_time = millis();
+      rpm_sum = 0.0f;
+      sample_count = 0;
+      currentState = FINE_TUNE_ASCENDING;
+      break;
+    }
+    case FINE_TUNE_ASCENDING: {
+      motor.move(6.0);
+      if ((millis() - last_step_time > STABILIZE_TIME) && (millis() - last_sample_time > SAMPLE_INTERVAL)) {
+        rpm_sum += motor.shaft_velocity * 9.5493f;
+        sample_count++;
+        last_sample_time = millis();
+      }
+      if (millis() - last_step_time > (STABILIZE_TIME + SAMPLE_TIME)) {
+        float avg_rpm = (sample_count > 0) ? (rpm_sum / sample_count) : 0;
+        Serial.print("Fine Step: Angle "); Serial.print(motor.zero_electric_angle, 4);
+        Serial.print(" -> Avg RPM: "); Serial.print(avg_rpm);
+        if (avg_rpm > best_rpm) {
+          Serial.println(" (Improving)");
+          best_rpm = avg_rpm;
+          best_angle = motor.zero_electric_angle;
+          motor.zero_electric_angle += step_direction;
+        } else {
+          Serial.println(" (Worse, reversing)");
+          step_direction *= -1.0f;
+          reversals++;
+          motor.zero_electric_angle = best_angle + step_direction;
+          if (reversals >= 2) {
+            currentState = TUNING_COMPLETE;
+          }
+        }
+        last_step_time = millis();
+        rpm_sum = 0.0f;
+        sample_count = 0;
+      }
+      break;
+    }
+    case TUNING_COMPLETE: {
+      motor.move(0);
+      Serial.println(F("\n--- Tuning Complete: Peak Found! ---"));
+      Serial.print(F("Optimal Zero Electric Angle: ")); Serial.println(best_angle, 4);
+      Serial.print(F("Sensor Direction remains: ")); Serial.println((motor.sensor_direction == Direction::CW) ? "CW" : "CCW");
+      Serial.print(F("Max Average RPM achieved at 6V: ")); Serial.println(best_rpm);
+      Serial.println(F("\n---> Copy these two values into your final code! <---"));
+      motor.zero_electric_angle = best_angle;
+      currentState = IDLE;
+      break;
+    }
+    case IDLE: {
+      motor.move(0);
+      break;
+    }
+  }
+}

@@ -1,0 +1,57 @@
+#include <Arduino.h>
+#include "driver/twai.h" // The native ESP-IDF TWAI/CAN driver
+
+//-- Pin Definitions from your Schematic --//
+const int CAN_STBY_PIN = 47; 
+const gpio_num_t CAN_TX_PIN = GPIO_NUM_48;
+const gpio_num_t CAN_RX_PIN = GPIO_NUM_34;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+  Serial.println("--- Native TWAI/CAN Transmitter ---");
+
+  // Step 1: Enable the CAN transceiver chip
+  pinMode(CAN_STBY_PIN, OUTPUT);
+  digitalWrite(CAN_STBY_PIN, LOW);
+
+  // Step 2: Configure the TWAI driver
+  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
+  twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS(); // 500kbit/s
+  twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+  // Step 3: Install and start the driver
+  if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
+    Serial.println("Failed to install TWAI driver");
+    return;
+  }
+  if (twai_start() != ESP_OK) {
+    Serial.println("Failed to start TWAI driver");
+    return;
+  }
+  
+  Serial.println("Driver started. Sending messages...");
+}
+
+void loop() {
+  static uint8_t counter = 0;
+
+  // Create a message
+  twai_message_t message;
+  message.identifier = 0x1A5; // Message ID
+  message.data_length_code = 4;
+  message.data[0] = 'C';
+  message.data[1] = 'A';
+  message.data[2] = 'N';
+  message.data[3] = counter;
+
+  // Queue the message for transmission
+  if (twai_transmit(&message, pdMS_TO_TICKS(1000)) == ESP_OK) {
+    Serial.printf("Sent message with counter: %d\n", counter);
+  } else {
+    Serial.println("Failed to send message");
+  }
+
+  counter++;
+  delay(1000);
+}

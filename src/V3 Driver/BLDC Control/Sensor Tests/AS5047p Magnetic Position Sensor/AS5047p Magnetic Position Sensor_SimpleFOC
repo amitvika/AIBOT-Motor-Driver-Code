@@ -1,0 +1,117 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <SimpleFOC.h>
+
+// ==========================================================================
+// Custom Sensor Class using YOUR working code
+// ==========================================================================
+class MyAS5047PSensor : public Sensor {
+public:
+  // Constructor
+  MyAS5047PSensor();
+  // Sensor initialization
+  void init() override;
+  // Get angle method that SimpleFOC will call
+  float getSensorAngle() override;
+
+private:
+  // Your proven functions to read the sensor
+  uint16_t readRawAngle();
+  uint8_t calculateEvenParity(uint16_t value);
+  // SPI settings
+  SPISettings spi_settings;
+};
+
+// Constructor: Initializes the SPI settings object
+MyAS5047PSensor::MyAS5047PSensor() : spi_settings(1000000, MSBFIRST, SPI_MODE1) {}
+
+// Initialization: Sets up the SPI pins
+void MyAS5047PSensor::init() {
+  pinMode(4, OUTPUT); // CS Pin
+  digitalWrite(4, HIGH);
+  SPI.begin(12, 13, 14); // SCK, MISO, MOSI
+}
+
+// This is the core function. SimpleFOC calls this to get the angle.
+float MyAS5047PSensor::getSensorAngle() {
+  uint16_t raw_angle = readRawAngle();
+  // Convert the 14-bit raw value to radians
+  return (float)raw_angle * (_2PI / 16384.0f);
+}
+
+// Your working function to calculate parity
+uint8_t MyAS5047PSensor::calculateEvenParity(uint16_t value) {
+  uint8_t count = 0;
+  for (int i = 0; i < 16; i++) {
+    if (value & 0x01) count++;
+    value >>= 1;
+  }
+  return count % 2;
+}
+
+// Your working function to read the angle
+uint16_t MyAS5047PSensor::readRawAngle() {
+  const uint16_t REG_ANGLEUNC = 0x3FFE;
+  const uint16_t REG_NOP = 0x0000;
+  const uint16_t CMD_READ_FLAG = 0x4000;
+
+  uint16_t command = CMD_READ_FLAG | REG_ANGLEUNC;
+  if (calculateEvenParity(command)) {
+    command |= 0x8000;
+  }
+
+  SPI.beginTransaction(spi_settings);
+  digitalWrite(4, LOW);
+  SPI.transfer16(command);
+  digitalWrite(4, HIGH);
+  SPI.endTransaction();
+
+  delayMicroseconds(1);
+
+  command = CMD_READ_FLAG | REG_NOP;
+  if (calculateEvenParity(command)) {
+    command |= 0x8000;
+  }
+
+  SPI.beginTransaction(spi_settings);
+  digitalWrite(4, LOW);
+  uint16_t receivedData = SPI.transfer16(command);
+  digitalWrite(4, HIGH);
+  SPI.endTransaction();
+
+  return receivedData & 0x3FFF;
+}
+// ==========================================================================
+// End of Custom Sensor Class
+// ==========================================================================
+
+
+// ==========================================================================
+// Main Test Application
+// ==========================================================================
+
+// Instantiate our new custom sensor
+MyAS5047PSensor sensor;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("Custom Sensor Test");
+
+  // This initializes the SPI pins inside our custom class
+  sensor.init();
+
+  Serial.println("Sensor Initialized. Reading angles...");
+}
+
+void loop() {
+  // Get the angle using the main sensor function.
+  // Note: We don't need sensor.update() because our getSensorAngle()
+  // function does a full read every time it's called.
+  float angle_radians = sensor.getSensorAngle();
+
+  Serial.print("Angle (rad): ");
+  Serial.println(angle_radians, 4);
+
+  delay(100);
+}

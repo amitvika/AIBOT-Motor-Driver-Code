@@ -1,0 +1,46 @@
+#include <Arduino.h>
+#include <SimpleFOC.h>
+
+// ====== EDIT ======
+#define POLE_PAIRS      7          // set to your motor's pole pair count
+const float SUPPLY_VOLTAGE = 25.0; // PSU/battery voltage
+const float VOLTAGE_LIMIT  = 1;  // raise if the motor stalls (e.g., 4–6 V)
+const long  PWM_FREQ       = 3000;
+const float TARGET_RPS     = 1.0;  // 1 revolution per second
+// ===================
+
+// ESP32-S3 phase pins
+const int PIN_U = 38;
+const int PIN_V = 39;
+const int PIN_W = 40;
+
+BLDCMotor motor(POLE_PAIRS);
+BLDCDriver3PWM driver(PIN_U, PIN_V, PIN_W);
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  driver.voltage_power_supply = SUPPLY_VOLTAGE;
+  driver.pwm_frequency        = PWM_FREQ;
+  driver.init();
+
+  motor.linkDriver(&driver);
+  motor.controller    = MotionControlType::velocity_openloop;
+  motor.voltage_limit = VOLTAGE_LIMIT;
+  motor.init();  // open-loop doesn't require initFOC()
+
+  Serial.println(F("Open-loop velocity: 1 rps"));
+}
+
+void loop() {
+  const float target_vel_rad_s = 2.0f * PI * TARGET_RPS;  // 1 rps -> 2π rad/s
+  motor.move(target_vel_rad_s);
+
+  // optional lightweight heartbeat
+  static uint32_t t0 = 0;
+  if (millis() - t0 > 500) {
+    t0 = millis();
+    Serial.println(F("running..."));
+  }
+}

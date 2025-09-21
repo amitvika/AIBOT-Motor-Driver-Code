@@ -1,0 +1,80 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+ #include <HTTPClient.h>
+
+// I2C Slave Address (should match the address used by the master)
+#define SLAVE_ADDR 0x08
+
+// Buffer to hold incoming I2C data
+#define BUFFER_SIZE 12 // 6 joint angles * 2 bytes each
+byte i2cBuffer[BUFFER_SIZE];
+
+// Array to hold the reconstructed joint angles
+int joint_angles[6];
+
+// Function Prototypes
+void receiveEvent(int numBytes);
+void processJointAngles();
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000); // Allow time for Serial Monitor to initialize
+
+  // Initialize I2C as a slave
+  Wire.begin(SLAVE_ADDR); // Initialize I2C with the slave address
+  Wire.onReceive(receiveEvent); // Register the receive event
+
+  Serial.println("I2C Slave Initialized. Waiting for data...");
+}
+
+void loop() {
+  // Main loop can perform other tasks or go to sleep
+  // For this example, we will just delay
+  delay(100);
+}
+
+// Function to handle incoming I2C data
+void receiveEvent(int numBytes) {
+  if (numBytes == BUFFER_SIZE) {
+    // Read the incoming data into the buffer
+    for (int i = 0; i < BUFFER_SIZE; i++) {
+      if (Wire.available()) {
+        i2cBuffer[i] = Wire.read();
+      }
+    }
+    // Process the received joint angles
+    processJointAngles();
+  } else {
+    // Handle error: unexpected number of bytes received
+    Serial.print("Unexpected number of bytes received: ");
+    Serial.println(numBytes);
+    while (Wire.available()) {
+      Wire.read(); // Clear the buffer
+    }
+  }
+}
+
+// Function to process the received joint angles
+void processJointAngles() {
+  for (int i = 0; i < 6; ++i) {
+    byte highByte = i2cBuffer[2 * i];     // Upper 4 bits
+    byte lowByte = i2cBuffer[2 * i + 1];  // Lower 8 bits
+
+    // Reconstruct the 12-bit joint angle
+    int angle = ((highByte & 0x0F) << 8) | lowByte;
+    joint_angles[i] = angle;
+  }
+
+  // Print the joint angles
+  Serial.print("Received Joint Angles: ");
+  for (int i = 0; i < 6; ++i) {
+    Serial.printf("Jnt %d: %d ", i + 1, joint_angles[i]);
+  }
+  Serial.println();
+
+  // You can add code here to control servos or motors using the joint angles
+  // For example:
+  // controlMotors(joint_angles);
+}

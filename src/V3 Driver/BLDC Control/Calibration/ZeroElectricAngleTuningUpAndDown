@@ -1,0 +1,196 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <SimpleFOC.h>
+
+// ==========================================================================
+// Custom Sensor Class (No changes)
+// ==========================================================================
+class MyAS5047PSensor : public Sensor {
+public:
+    MyAS5047PSensor() : spi_settings(10000000, MSBFIRST, SPI_MODE1) {}
+    void init() override {
+        pinMode(4, OUTPUT);
+        digitalWrite(4, HIGH);
+        SPI.begin(12, 13, 14);
+    }
+    float getSensorAngle() override {
+        uint16_t raw_angle = readRawAngle();
+        return (float)raw_angle * (_2PI / 16384.0f);
+    }
+private:
+    uint16_t readRawAngle() {
+        const uint16_t REG_ANGLEUNC = 0x3FFE, REG_NOP = 0x0000, CMD_READ_FLAG = 0x4000;
+        uint16_t command = CMD_READ_FLAG | REG_ANGLEUNC;
+        if (calculateEvenParity(command)) command |= 0x8000;
+        SPI.beginTransaction(spi_settings);
+        digitalWrite(4, LOW);
+        SPI.transfer16(command);
+        digitalWrite(4, HIGH);
+        SPI.endTransaction();
+        delayMicroseconds(1);
+        command = CMD_READ_FLAG | REG_NOP;
+        if (calculateEvenParity(command)) command |= 0x8000;
+        SPI.beginTransaction(spi_settings);
+        digitalWrite(4, LOW);
+        uint16_t receivedData = SPI.transfer16(command);
+        digitalWrite(4, HIGH);
+        SPI.endTransaction();
+        return receivedData & 0x3FFF;
+    }
+    uint8_t calculateEvenParity(uint16_t value) {
+        uint8_t count = 0;
+        for (int i = 0; i < 16; i++) {
+            if (value & 0x01) count++;
+            value >>= 1;
+        }
+        return count % 2;
+    }
+    SPISettings spi_settings;
+};
+
+// ==========================================================================
+// Main FOC Application
+// ==========================================================================
+
+const int PIN_U = 38, PIN_V = 39, PIN_W = 40;
+const int POLE_PAIRS = 7;
+
+BLDCMotor motor(POLE_PAIRS);
+BLDCDriver3PWM driver(PIN_U, PIN_V, PIN_W, NOT_SET);
+MyAS5047PSensor sensor;
+
+// --- New variables for the hill-climbing tuning process ---
+enum TuningState { INITIALIZING, ASCENDING, TUNING_COMPLETE, IDLE };
+TuningState currentState = IDLE;
+
+float best_angle = 0.0f;
+float last_rpm = 0.0f;
+float step_direction = 0.01f; // Start by increasing the angle
+const float ANGLE_STEP = 0.01f;
+const unsigned long STEP_INTERVAL = 4000; // 4 seconds to allow stabilization
+unsigned long last_step_time = 0;
+int reversals = 0; // Count how many times we've changed direction
+
+
+void setup() {
+    Serial.begin(115200);
+    delay(200);
+    Serial.println(F("Motor Control with Hill-Climbing Tuner"));
+
+    sensor.init();
+    motor.linkSensor(&sensor);
+
+    driver.voltage_power_supply = 25.0;
+    driver.voltage_limit = 6.0;
+    driver.pwm_frequency = 3000;
+    driver.init();
+    motor.linkDriver(&driver);
+    
+    motor.voltage_limit = 6.0;
+    motor.voltage_sensor_align = 2.0;
+    
+    motor.torque_controller = TorqueControlType::voltage;
+    motor.controller = MotionControlType::torque;
+    motor.foc_modulation = FOCModulationType::SpaceVectorPWM;
+
+    motor.PID_velocity.I = 0.0f;
+    motor.LPF_velocity.Tf = 0.2f;
+
+    motor.monitor_port = &Serial;
+    motor.init();
+    //motor.zero_electric_angle = 3.36f;        // comment out to use automatic alignment
+    //motor.sensor_direction = Direction::CCW;  // comment out to use automatic alignment
+    motor.initFOC();
+    motor.monitor_port = nullptr;
+
+    Serial.println(F("--- Initial Alignment Found ---"));
+    Serial.print(F("Base Angle: "));
+    Serial.println(motor.zero_electric_angle, 4);
+    Serial.print(F("Sensor direction: "));
+    Serial.println(motor.sensor_direction == Direction::CW ? "CW" : (motor.sensor_direction == Direction::CCW ? "CCW" : "UNKNOWN"));
+    Serial.println(F("\n--- Starting Hill-Climbing Algorithm ---"));
+    
+    // Initialize tuning variables
+    best_angle = motor.zero_electric_angle;
+    last_step_time = millis();
+    currentState = INITIALIZING; // Start the tuning process
+}
+
+void loop() {
+    motor.loopFOC();
+
+    switch (currentState) {
+        case INITIALIZING: {
+            motor.move(6.0); // Apply 6V to spin up
+            // Wait for motor to stabilize at the initial angle
+            if (millis() - last_step_time > 3000) { 
+                last_rpm = motor.shaft_velocity * 9.5493f;
+                Serial.print("Initial RPM at base angle ");
+                Serial.print(best_angle, 4);
+                Serial.print(": ");
+                Serial.println(last_rpm);
+                
+                // Take the first step
+                motor.zero_electric_angle += step_direction;
+                Serial.println("Taking first step...");
+                
+                last_step_time = millis();
+                currentState = ASCENDING;
+            }
+            break;
+        }
+
+        case ASCENDING: {
+            motor.move(6.0); // Keep motor running at 6V
+            if (millis() - last_step_time > STEP_INTERVAL) {
+                float current_rpm = motor.shaft_velocity * 9.5493f;
+                
+                Serial.print("Angle: "); Serial.print(motor.zero_electric_angle, 4);
+                Serial.print(" -> RPM: "); Serial.print(current_rpm);
+
+                if (current_rpm > last_rpm) {
+                    // --- We're going in the right direction! ---
+                    Serial.println(" (Improving)");
+                    best_angle = motor.zero_electric_angle;
+                    last_rpm = current_rpm;
+                    // Take another step in the same direction
+                    motor.zero_electric_angle += step_direction;
+                } else {
+                    // --- RPM dropped, we passed the peak or went the wrong way ---
+                    Serial.println(" (Worse, reversing direction)");
+                    step_direction *= -1.0f; // Reverse direction
+                    reversals++;
+                    
+                    // Go back to the last known best angle and take a small step in the new direction
+                    motor.zero_electric_angle = best_angle + step_direction;
+
+                    if (reversals >= 2) {
+                        // If we've reversed twice, we are oscillating around the peak. Settle here.
+                        currentState = TUNING_COMPLETE;
+                    }
+                }
+                last_step_time = millis();
+            }
+            break;
+        }
+
+        case TUNING_COMPLETE: {
+            motor.move(0); // Stop the motor
+            Serial.println(F("\n--- Tuning Complete: Peak Found! ---"));
+            Serial.print(F("Optimal Zero Electric Angle: "));
+            Serial.println(best_angle, 4);
+            Serial.print(F("Max RPM achieved at 6V: "));
+            Serial.println(last_rpm);
+            
+            motor.zero_electric_angle = best_angle; // Lock in the best angle
+            currentState = IDLE;
+            break;
+        }
+
+        case IDLE: {
+            // Do nothing. Motor is tuned and stopped.
+            motor.move(0);
+            break;
+        }
+    }
+}

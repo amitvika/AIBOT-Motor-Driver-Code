@@ -1,0 +1,138 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <SimpleFOC.h>
+
+// ==========================================================================
+// Custom Sensor Class (Verified Working)
+// ==========================================================================
+class MyAS5047PSensor : public Sensor {
+public:
+  MyAS5047PSensor();
+  void init() override;
+  float getSensorAngle() override;
+private:
+  uint16_t readRawAngle();
+  uint8_t calculateEvenParity(uint16_t value);
+  SPISettings spi_settings;
+};
+// To this:
+MyAS5047PSensor::MyAS5047PSensor() : spi_settings(10000000, MSBFIRST, SPI_MODE1) {} // 10 MHz
+void MyAS5047PSensor::init() {
+  pinMode(4, OUTPUT);
+  digitalWrite(4, HIGH);
+  SPI.begin(12, 13, 14);
+}
+float MyAS5047PSensor::getSensorAngle() {
+  uint16_t raw_angle = readRawAngle();
+  return (float)raw_angle * (_2PI / 16384.0f);
+}
+uint8_t MyAS5047PSensor::calculateEvenParity(uint16_t value) {
+  uint8_t count = 0;
+  for (int i = 0; i < 16; i++) {
+    if (value & 0x01) count++;
+    value >>= 1;
+  }
+  return count % 2;
+}
+uint16_t MyAS5047PSensor::readRawAngle() {
+  const uint16_t REG_ANGLEUNC = 0x3FFE;
+  const uint16_t REG_NOP = 0x0000;
+  const uint16_t CMD_READ_FLAG = 0x4000;
+  uint16_t command = CMD_READ_FLAG | REG_ANGLEUNC;
+  if (calculateEvenParity(command)) { command |= 0x8000; }
+  SPI.beginTransaction(spi_settings);
+  digitalWrite(4, LOW);
+  SPI.transfer16(command);
+  digitalWrite(4, HIGH);
+  SPI.endTransaction();
+  delayMicroseconds(1);
+  command = CMD_READ_FLAG | REG_NOP;
+  if (calculateEvenParity(command)) { command |= 0x8000; }
+  SPI.beginTransaction(spi_settings);
+  digitalWrite(4, LOW);
+  uint16_t receivedData = SPI.transfer16(command);
+  digitalWrite(4, HIGH);
+  SPI.endTransaction();
+  return receivedData & 0x3FFF;
+}
+// ==========================================================================
+// End of Custom Sensor Class
+// ==========================================================================
+
+
+// ==========================================================================
+// Main FOC Application
+// ==========================================================================
+
+// ---------- Motor & Driver Params ----------
+const int PIN_U = 38;
+const int PIN_V = 39;
+const int PIN_W = 40;
+const int POLE_PAIRS = 7; // <<-- Double-check this! Count magnets on your rotor and divide by 2.
+
+// ---------- Objects ----------
+BLDCMotor motor(POLE_PAIRS);
+BLDCDriver3PWM driver(PIN_U, PIN_V, PIN_W, NOT_SET);
+MyAS5047PSensor sensor;
+// Test with the original pin mapping first. If it fails, swap 8 and 9.
+InlineCurrentSense current_sense(0.001f, 50.0f, NOT_SET, 9, 8);
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println(F("--- Starting Full Diagnostic Check ---"));
+
+  sensor.init();
+  motor.linkSensor(&sensor);
+
+  driver.voltage_power_supply = 25.0;
+  driver.pwm_frequency = 3000;
+  driver.init();
+  motor.linkDriver(&driver);
+
+  // Initialize and link the current sensor
+  current_sense.init();
+  current_sense.linkDriver(&driver);
+  motor.linkCurrentSense(&current_sense);
+
+  motor.torque_controller = TorqueControlType::foc_current;
+  motor.controller = MotionControlType::velocity;
+  motor.voltage_sensor_align = 1.0;
+  motor.voltage_limit = 4.0; // Your voltage limit
+  motor.current_limit = 2.0;
+
+  // <<-- Using safe, stable tuning parameters for diagnosis
+  motor.PID_current_q.P = 1.0;
+  motor.PID_current_q.I = 0;
+  motor.PID_current_d.P = 1.0;
+  motor.PID_current_d.I = 0;
+  motor.LPF_current_q.Tf = 0.01;
+  motor.LPF_current_d.Tf = 0.01;
+  motor.PID_velocity.P = 0.2;
+  motor.PID_velocity.I = 2.0;
+  motor.LPF_velocity.Tf = 0.05f;
+
+  motor.init();
+  motor.initFOC();
+  
+  // <<-- DIAGNOSTIC REPORT -->>
+  Serial.println("\n--- DIAGNOSTIC REPORT ---");
+  Serial.print("Zero Electric Angle: "); Serial.println(motor.zero_electric_angle, 4);
+  Serial.print("Sensor Direction: "); Serial.println(motor.sensor_direction);
+  Serial.println("-------------------------");
+
+  // Enable monitoring
+  motor.useMonitoring(Serial);
+
+  Serial.println(F("\nMotor setup complete. Monitoring at rest..."));
+}
+
+void loop() {
+  motor.loopFOC();
+
+  // <<-- For diagnosis, we only monitor the values at rest.
+  // We do not command any movement yet.
+  motor.monitor();
+  delay(2); // slow down monitor output
+}

@@ -1,0 +1,165 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <esp_now.h>
+ #include <WiFiClientSecure.h>
+ #include <HTTPClient.h>
+// I2C and Motor Control Pins
+#define SDA_PIN_SENSOR 18
+#define SCL_PIN_SENSOR 19
+#define MOTOR_CTRL_PIN1 22
+#define MOTOR_CTRL_PIN2 25
+
+#define AS5600_ADDRESS 0x36
+
+// Control parameters
+uint16_t desiredPosition = 2000;  
+float kp = 2.0;
+int maxPWM = 255;
+int positionErrorAllowance = 1;
+int deadZone = 15;
+
+// This variable selects which actuator position to use from the received data.
+// Adjust this index as needed (0 through 5)
+uint8_t actuatorIndex = 0; 
+
+// For validation of sensor readings
+uint16_t lastValidAngle = 2000; 
+const uint16_t maxAllowedJump = 5000; 
+
+// Structure to match what is sent by the master (6 actuator positions)
+typedef struct {
+    uint16_t actuatorPositions[6];
+} ActuatorData;
+
+ActuatorData receivedData; 
+
+// Function to read raw angle from AS5600 sensor
+uint16_t readAS5600Angle(TwoWire &wireBus, uint16_t &lastValidAngle) {
+    uint16_t angle = 0;
+
+    wireBus.beginTransmission(AS5600_ADDRESS);
+    wireBus.write(0x0C); // Register for 'ANGLE'
+    if (wireBus.endTransmission(false) != 0) {
+        Serial.println("Error: Sensor not responding. Using last valid reading.");
+        return lastValidAngle;
+    }
+
+    wireBus.requestFrom(AS5600_ADDRESS, (uint8_t)2);
+    if (wireBus.available() == 2) {
+        uint8_t highByte = wireBus.read();
+        uint8_t lowByte = wireBus.read();
+        angle = ((uint16_t)highByte << 8) | lowByte;
+        angle = angle & 0x0FFF; // 12-bit mask
+
+        // Validate the reading
+        if (abs((int)angle - (int)lastValidAngle) > maxAllowedJump) {
+            Serial.println("Warning: Sudden jump detected. Ignoring invalid reading.");
+            return lastValidAngle;
+        }
+
+        lastValidAngle = angle;
+    } else {
+        Serial.println("Error: Incomplete data received from sensor. Using last valid reading.");
+        return lastValidAngle;
+    }
+
+    return angle;
+}
+
+// Control motor based on sensor feedback
+void controlMotor(uint16_t currentPosition, uint16_t desiredPosition, uint8_t forwardPin, uint8_t reversePin) {
+    int error = desiredPosition - currentPosition;
+
+    if (abs(error) <= positionErrorAllowance) {
+        analogWrite(forwardPin, 0);
+        analogWrite(reversePin, 0);
+        return;
+    }
+
+    int pwmValue = kp * error;
+    pwmValue = constrain(pwmValue, -maxPWM, maxPWM);
+
+    if (pwmValue > 0) {
+        pwmValue = max(pwmValue, deadZone);
+        analogWrite(forwardPin, pwmValue);
+        analogWrite(reversePin, 0);
+    } else if (pwmValue < 0) {
+        pwmValue = min(pwmValue, -deadZone);
+        analogWrite(forwardPin, 0);
+        analogWrite(reversePin, -pwmValue);
+    } else {
+        analogWrite(forwardPin, 0);
+        analogWrite(reversePin, 0);
+    }
+}
+
+// ESP-NOW callback when data is received
+void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
+    if (len == sizeof(ActuatorData)) {
+        memcpy(&receivedData, incomingData, sizeof(ActuatorData));
+
+        // Here we select which actuator to control
+        desiredPosition = receivedData.actuatorPositions[actuatorIndex];
+
+       /* Serial.print("Data received: Actuator positions: [");
+        for (int i = 0; i < 6; i++) {
+            Serial.print(receivedData.actuatorPositions[i]);
+            if (i < 5) Serial.print(", ");
+        }
+        Serial.println("]");
+
+        Serial.print("Selected actuator index: ");
+        Serial.print(actuatorIndex);
+        Serial.print(", Desired position: ");
+        Serial.println(desiredPosition);*/
+    } else {
+        Serial.println("Received data size does not match ActuatorData structure.");
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    // Configure I/O
+    pinMode(32, INPUT_PULLUP);
+    pinMode(16, INPUT_PULLUP);
+    pinMode(21, INPUT_PULLUP);
+    pinMode(4, INPUT_PULLDOWN);
+
+    // Initialize I2C
+    Wire.begin(SDA_PIN_SENSOR, SCL_PIN_SENSOR);
+
+    // Motor control pins
+    pinMode(MOTOR_CTRL_PIN1, OUTPUT);
+    pinMode(MOTOR_CTRL_PIN2, OUTPUT);
+
+    // Initialize Wi-Fi and ESP-NOW
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("Error initializing ESP-NOW");
+        return;
+    }
+    esp_now_register_recv_cb(onDataRecv);
+
+    // Print MAC address
+    Serial.print("Slave MAC Address: ");
+    Serial.println(WiFi.macAddress());
+}
+
+void loop() {
+    uint16_t angle = readAS5600Angle(Wire, lastValidAngle);
+    int error = desiredPosition - angle;
+
+    Serial.print("Angle: ");
+    Serial.print(angle);
+    Serial.print(" Error: ");
+    Serial.println(error);
+
+    controlMotor(angle, desiredPosition, MOTOR_CTRL_PIN1, MOTOR_CTRL_PIN2);
+
+    delay(10);
+}

@@ -1,0 +1,138 @@
+ 
+ #include <Adafruit_BusIO_Register.h>
+  #include <Adafruit_Sensor.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <ArduinoWebsockets.h>
+
+// If you only want minimal overhead, you can remove debug statements.
+using namespace websockets;
+
+// ---------------------------
+// Wi-Fi Credentials
+// ---------------------------
+const char* ssid = "The Best Is Yet To Come!";
+const char* password = "blessings1";
+const char* websocketServer = "ws://64.225.55.176:8765";
+
+// ---------------------------
+// WebSocket Client
+// ---------------------------
+WebsocketsClient webSocket;
+bool websocketConnected = false;
+unsigned long lastReconnectAttempt = 0;
+
+// ---------------------------
+// UART / Serial2 Setup
+// ---------------------------
+static const int UART_RX_PIN = 16;   // Not used in this code, just in case
+static const int UART_TX_PIN = 17;   // We are writing out to this pin
+static const unsigned long UART_BAUD = 2000000;
+
+void onWebSocketEvent(WebsocketsEvent event, String data) {
+    switch(event) {
+        case WebsocketsEvent::ConnectionOpened:
+            Serial.println("WebSocket Connection Opened");
+            // Identify as 'robot'
+            webSocket.send("{\"type\": \"robot\"}");
+            websocketConnected = true;
+            break;
+
+        case WebsocketsEvent::ConnectionClosed:
+            Serial.println("WebSocket Connection Closed");
+            websocketConnected = false;
+            break;
+
+        case WebsocketsEvent::GotPing:
+            // Respond to pings with pong if you want
+            webSocket.send("pong");
+            break;
+
+        case WebsocketsEvent::GotPong:
+            // Debug if needed
+            // Serial.println("Got Pong from server");
+            break;
+    }
+}
+
+void reconnectWebSocket() {
+    if (WiFi.status() == WL_CONNECTED && !websocketConnected) {
+        Serial.println("Attempting to reconnect to WebSocket...");
+        bool connected = webSocket.connect(websocketServer);
+        if (connected) {
+            Serial.println("Reconnected to WebSocket server");
+            websocketConnected = true;
+        } else {
+            Serial.println("Failed to reconnect, will try again...");
+        }
+    }
+}
+
+void setup() {
+    // Debug serial
+    Serial.begin(115200);
+    // Serial2 for forwarding to next ESP32
+    Serial2.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+
+    // Wi-Fi
+    Serial.println("Connecting to Wi-Fi...");
+    WiFi.mode(WIFI_STA);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    WiFi.begin(ssid, password);
+
+    unsigned long wifiConnectStart = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        if (millis() - wifiConnectStart > 2000) {
+            Serial.println("\nFailed to connect Wi-Fi, restarting...");
+            ESP.restart();
+        }
+        delay(50);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi connected.");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+
+    // WebSocket
+    webSocket.onEvent(onWebSocketEvent);
+    // Our onMessage callback
+    webSocket.onMessage([](WebsocketsMessage message){
+        // If text => forward it out Serial2
+        if (message.isText()) {
+            String textLine = message.data();
+            // Debug
+            Serial.println("Got text from server:");
+            Serial.println(textLine);
+
+            // Forward this line to the next ESP32 over Serial2
+            // We add a newline so the next ESP32 sees each line separately
+            Serial2.print(textLine);
+            Serial2.print('\n');
+        }
+    });
+
+    bool ok = webSocket.connect(websocketServer);
+    if (ok) {
+        Serial.println("Connected to WebSocket server");
+        websocketConnected = true;
+    } else {
+        Serial.println("Failed initial WebSocket connection. Will retry in loop.");
+        websocketConnected = false;
+    }
+
+    lastReconnectAttempt = millis();
+}
+
+void loop() {
+    // Maintain WebSocket
+    webSocket.poll();
+
+    // Retry connect if needed
+    if (!websocketConnected && (millis() - lastReconnectAttempt > 2000)) {
+        lastReconnectAttempt = millis();
+        reconnectWebSocket();
+    }
+
+    // No delay here for minimal overhead
+}

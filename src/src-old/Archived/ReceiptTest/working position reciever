@@ -1,0 +1,176 @@
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <ArduinoWebsockets.h>
+
+using namespace websockets;
+
+// Replace with your Wi-Fi credentials
+const char* ssid = "The Best Is Yet To Come!";
+const char* password = "blessings1";
+
+// WebSocket client instance
+WebsocketsClient webSocket;
+
+// WebSocket server address
+//const char* websocketServer = "ws://192.168.68.111:8765"; // Replace with your server IP and port
+//const char* websocketServer = "ws://170.64.206.138:8765";
+const char* websocketServer = "ws://64.225.55.176:8765";
+
+// Function Prototypes
+void onWebSocketEvent(WebsocketsEvent event, String data);
+void websocketTask(void * pvParameters);
+void keepAliveTask(void * pvParameters);
+
+// WebSocket Event Handler
+void onWebSocketEvent(WebsocketsEvent event, String data) {
+    if(event == WebsocketsEvent::ConnectionOpened) {
+        Serial.println("WebSocket Connection Opened");
+        // Send an initial message to identify the client
+        webSocket.send("{\"type\": \"robot\"}");
+    } 
+    else if(event == WebsocketsEvent::ConnectionClosed) {
+        Serial.println("WebSocket Connection Closed, attempting to reconnect");
+        // Attempt to reconnect
+        webSocket.connect(websocketServer);
+    } 
+    else if(event == WebsocketsEvent::GotPing) {
+        Serial.println("Received ping from server");
+        // Respond with pong
+        webSocket.send("pong");
+    } 
+    else if(event == WebsocketsEvent::GotPong) {
+        Serial.println("Received pong from server");
+    }
+    // Optionally handle other events
+}
+
+// Setup Function
+void setup() {
+    Serial.begin(115200);
+    delay(1000); // Allow time for Serial Monitor to initialize
+
+    // Connect to Wi-Fi
+    Serial.println("Connecting to Wi-Fi...");
+    WiFi.begin(ssid, password);
+
+    // Non-blocking Wi-Fi connection with timeout
+    unsigned long wifiConnectStart = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        if (millis() - wifiConnectStart > 20000) { // Timeout after 20 seconds
+            Serial.println("\nFailed to connect to Wi-Fi, restarting...");
+            ESP.restart(); // Restart and retry
+        }
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nConnected to Wi-Fi");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    // Set WebSocket event handler
+    webSocket.onEvent(onWebSocketEvent);
+
+    // Set WebSocket message handler
+    webSocket.onMessage([](WebsocketsMessage message) {
+        if (message.isText()) {
+            String data = message.data();
+            Serial.print("Received Text Message: ");
+            Serial.println(data);
+            // If needed, parse JSON and act on the data here
+            /*
+            StaticJsonDocument<200> doc;
+            DeserializationError error = deserializeJson(doc, data);
+            if (!error) {
+                // Handle JSON data
+                int command = doc["command"];
+                // Execute command
+            } else {
+                Serial.print("deserializeJson() failed: ");
+                Serial.println(error.c_str());
+            }
+            */
+        } else if (message.isBinary()) {
+            Serial.print("Received Binary Message of length: ");
+            Serial.println(message.length());
+            // Handle binary messages if necessary
+        }
+    });
+
+    // Connect to WebSocket server
+    bool connected = webSocket.connect(websocketServer);
+    if (connected) {
+        Serial.println("Connected to WebSocket server");
+    } else {
+        Serial.println("Failed to connect to WebSocket server, will attempt to reconnect");
+    }
+
+    // Create a task for handling WebSocket communication
+    xTaskCreatePinnedToCore(
+        websocketTask,   // Function to implement the task
+        "WebSocketTask", // Name of the task
+        10000,           // Stack size in words
+        NULL,            // Task input parameter
+        1,               // Priority of the task
+        NULL,            // Task handle
+        1);              // Core where the task should run (1 or 0)
+
+    // Create a task for keep-alive pings
+    xTaskCreatePinnedToCore(
+        keepAliveTask,   // Function to implement the task
+        "KeepAliveTask", // Name of the task
+        10000,           // Stack size in words
+        NULL,            // Task input parameter
+        1,               // Priority of the task
+        NULL,            // Task handle
+        1);              // Core where the task should run (1 or 0)
+
+    // Optionally, delete the setup task if no loop() is used
+    vTaskDelete(NULL);
+}
+
+// Loop Function (Empty because tasks handle everything)
+void loop() {
+    // Empty loop since tasks handle WebSocket communication
+}
+
+// Task to handle WebSocket communication
+void websocketTask(void * pvParameters) {
+    while(true) {
+        webSocket.poll(); // Process WebSocket events
+
+        // Here you can add your robot control commands
+        // For example, sending sensor data or control commands
+        // Example:
+        /*
+        StaticJsonDocument<200> doc;
+        doc["command"] = "move_forward";
+        String output;
+        serializeJson(doc, output);
+        webSocket.send(output);
+        */
+
+        vTaskDelay(10 / portTICK_PERIOD_MS); // Delay 10ms to allow other tasks to run
+    }
+}
+
+// Task to send keep-alive pings
+void keepAliveTask(void * pvParameters) {
+    const unsigned long pingInterval = 15000; // Ping every 15 seconds
+    unsigned long previousPingMillis = millis();
+
+    while(true) {
+        unsigned long currentMillis = millis();
+        if (currentMillis - previousPingMillis >= pingInterval) {
+            previousPingMillis = currentMillis;
+            if(webSocket.available()) {
+                webSocket.send("ping");
+                Serial.println("Sent ping");
+            } else {
+                Serial.println("WebSocket not available, attempting to reconnect");
+                webSocket.connect(websocketServer);
+            }
+        }
+        vTaskDelay(1000 / portTICK_PERIOD_MS); // Delay 1 second
+    }
+}

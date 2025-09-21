@@ -1,0 +1,128 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <SimpleFOC.h>
+
+// ==========================================================================
+// Custom Sensor Class (from your original code)
+// ==========================================================================
+class MyAS5047PSensor : public Sensor {
+public:
+  MyAS5047PSensor() : spi_settings(10000000, MSBFIRST, SPI_MODE1) {}
+  void init() override {
+    pinMode(4, OUTPUT);
+    digitalWrite(4, HIGH);
+    SPI.begin(12, 13, 14);
+  }
+  float getSensorAngle() override {
+    uint16_t raw_angle = readRawAngle();
+    return (float)raw_angle * (_2PI / 16384.0f);
+  }
+private:
+  uint16_t readRawAngle() {
+    const uint16_t REG_ANGLEUNC = 0x3FFE, REG_NOP = 0x0000, CMD_READ_FLAG = 0x4000;
+    uint16_t command = CMD_READ_FLAG | REG_ANGLEUNC;
+    if (calculateEvenParity(command)) command |= 0x8000;
+    SPI.beginTransaction(spi_settings);
+    digitalWrite(4, LOW);
+    SPI.transfer16(command);
+    digitalWrite(4, HIGH);
+    SPI.endTransaction();
+    delayMicroseconds(1);
+    command = CMD_READ_FLAG | REG_NOP;
+    if (calculateEvenParity(command)) command |= 0x8000;
+    SPI.beginTransaction(spi_settings);
+    digitalWrite(4, LOW);
+    uint16_t receivedData = SPI.transfer16(command);
+    digitalWrite(4, HIGH);
+    SPI.endTransaction();
+    return receivedData & 0x3FFF;
+  }
+  uint8_t calculateEvenParity(uint16_t value) {
+    uint8_t count = 0;
+    for (int i = 0; i < 16; i++) {
+      if (value & 0x01) count++;
+      value >>= 1;
+    }
+    return count % 2;
+  }
+  SPISettings spi_settings;
+};
+
+// ==========================================================================
+// Main FOC Application
+// ==========================================================================
+
+// Motor and driver parameters
+const int POLE_PAIRS = 50;
+StepperMotor motor(POLE_PAIRS);
+StepperDriver4PWM driver(37, 38, 39, 40); // Confirmed working pinout
+
+// Sensor instance
+MyAS5047PSensor sensor;
+
+// Target velocity in rad/s
+float target_velocity = 20.0f; 
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Stepper FOC - Closed-Loop Velocity Control");
+
+  // Initialize sensor
+  sensor.init();
+  motor.linkSensor(&sensor);
+
+  // Initialize driver
+  driver.voltage_power_supply = 25.0;
+  driver.init();
+  motor.linkDriver(&driver);
+
+  // Set control modes
+  motor.torque_controller = TorqueControlType::voltage;
+  motor.controller = MotionControlType::velocity;
+
+  // PID controller and LPF filter tuning
+  // These are good starting values, but you may need to tune them.
+  motor.PID_velocity.P = 0.5f;
+  motor.PID_velocity.I = 10.0f;
+  motor.PID_velocity.D = 0.0f;
+  motor.LPF_velocity.Tf = 0.01f; // Low pass filter timeframe
+
+  // Set motor limits
+  motor.voltage_limit = 25.0;
+  motor.voltage_sensor_align = 6.0; // Voltage used for sensor alignment
+
+  // Enable monitoring for FOC initialization
+  motor.monitor_port = &Serial;
+
+  // Initialize motor and FOC
+  motor.init();
+  motor.initFOC();
+  Serial.println("calibration motor electric angle: " + String(motor.zero_electric_angle, 4));
+  Serial.println("sensor direction: " + String(motor.sensor_direction));
+  // Disable monitoring after startup
+  motor.monitor_port = nullptr;
+
+  Serial.println("\nMotor ready for closed-loop control.");
+}
+
+void loop() {
+  // Main FOC algorithm function. Reads sensor, calculates angles, sets PWM.
+  motor.loopFOC();
+
+  // Sets the target velocity for the PID controller.
+  motor.move(target_velocity);
+
+  // Optional: Print target vs actual RPM for monitoring
+  static long last_print_ts = 0;
+  if (millis() - last_print_ts > 200) {
+    last_print_ts = millis();
+    float target_rpm = target_velocity * 9.5493f;
+    float actual_rpm = motor.shaft_velocity * 9.5493f; 
+    
+    Serial.print("Target: ");
+    Serial.print(target_rpm);
+    Serial.print(" RPM | Actual: ");
+    Serial.print(actual_rpm);
+    Serial.println(" RPM");
+  }
+}

@@ -1,0 +1,76 @@
+#include <Arduino.h>
+#include <math.h> // Required for the sin() function
+
+//-- ⚙️ Pin Definitions for the Working Motor --//
+const int MOTOR_PIN_A = 39; // Corresponds to Y1 also 38 and 39
+const int MOTOR_PIN_B = 40; // Corresponds to Y2
+
+//-- PWM Configuration --//
+const int PWM_FREQUENCY = 5000;
+const int PWM_RESOLUTION = 8;
+const int MAX_DUTY_CYCLE = (1 << PWM_RESOLUTION) - 1; // 255
+
+//-- LEDC PWM Channels --//
+const int CHANNEL_A = 0;
+const int CHANNEL_B = 1;
+
+/**
+ * @brief Controls the H-bridge based on a value from -1.0 to 1.0.
+ * @param controlValue The control signal. Positive for forward, negative for reverse.
+ * @param channelA The PWM channel for the 'A' input of the H-bridge.
+ * @param channelB The PWM channel for the 'B' input of the H-bridge.
+ */
+void driveMotor(float controlValue, int channelA, int channelB) {
+  // Calculate duty cycle from the absolute value of the control signal
+  int dutyCycle = (int)(fabs(controlValue) * MAX_DUTY_CYCLE);
+
+  if (controlValue > 0) {
+    // Forward direction
+    ledcWrite(channelA, dutyCycle);
+    ledcWrite(channelB, 0);
+  } else if (controlValue < 0) {
+    // Reverse direction
+    ledcWrite(channelA, 0);
+    ledcWrite(channelB, dutyCycle);
+  } else {
+    // Stop (brake)
+    ledcWrite(channelA, 0);
+    ledcWrite(channelB, 0);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+  Serial.println("--- Single Motor Sinusoidal Control ---");
+  Serial.printf("Controlling motor on Y1 (GPIO %d) and Y2 (GPIO %d).\n", MOTOR_PIN_A, MOTOR_PIN_B);
+
+  // Configure PWM channels for the motor
+  ledcSetup(CHANNEL_A, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcAttachPin(MOTOR_PIN_A, CHANNEL_A);
+  
+  ledcSetup(CHANNEL_B, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcAttachPin(MOTOR_PIN_B, CHANNEL_B);
+
+  Serial.println("PWM channels initialized. Starting control loop.");
+}
+
+void loop() {
+  static float baseAngle = 0.0;
+
+  // Generate a single control signal from a sine wave (-1.0 to 1.0)
+  float motorControl = sin(baseAngle);
+
+  // Drive the motor with the new control signal
+  driveMotor(motorControl, CHANNEL_A, CHANNEL_B);
+  
+  // Increment the angle for the next step to create continuous motion.
+  // Smaller values = slower motion.
+  baseAngle += 0.05;
+  if (baseAngle >= (2.0 * M_PI)) {
+    baseAngle -= (2.0 * M_PI);
+  }
+
+  // Delay to control the update rate
+  delay(10);
+}

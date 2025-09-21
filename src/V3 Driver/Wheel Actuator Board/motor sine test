@@ -1,0 +1,89 @@
+#include <Arduino.h>
+
+/*
+  ==============================================================================
+   Dual Motor Sine Wave Control for ESP32 (Newest API)
+  ==============================================================================
+   
+   Description:
+   This script is updated for the latest ESP32 Arduino Core versions that use
+   a simplified PWM API where channels are managed automatically.
+   
+   Pinout:
+   - Motor 1 Forward PWM: GPIO 38
+   - Motor 1 Reverse PWM: GPIO 39
+   - Motor 2 Forward PWM: GPIO 40
+   - Motor 2 Reverse PWM: GPIO 41
+*/
+
+// --- Pin Definitions ---
+const int M1_FORWARD_PIN = 38;
+const int M1_REVERSE_PIN = 39;
+const int M2_FORWARD_PIN = 37;
+const int M2_REVERSE_PIN = 40;
+
+// --- PWM Configuration ---
+const int PWM_FREQUENCY = 5000;
+const int PWM_RESOLUTION = 8; // 8-bit resolution (0-255)
+
+// --- Sine Wave Configuration ---
+const float SINE_WAVE_FREQUENCY = 0.5; // In Hz. 0.5 Hz = one cycle every 2 seconds.
+
+/**
+ * @brief Sets the speed and direction for a motor using pin numbers.
+ * @param forward_pin The GPIO pin for forward motion.
+ * @param reverse_pin The GPIO pin for reverse motion.
+ * @param speed A value from -1.0 (full reverse) to 1.0 (full forward).
+ */
+void setMotorSpeed(int forward_pin, int reverse_pin, float speed) {
+  // Ensure the speed value is within the -1.0 to 1.0 range
+  speed = constrain(speed, -1.0, 1.0);
+
+  if (speed >= 0.0) {
+    // Forward motion: write PWM to the forward pin
+    uint32_t dutyCycle = (uint32_t)(speed * 255.0);
+    ledcWrite(forward_pin, dutyCycle);
+    ledcWrite(reverse_pin, 0);
+  } else {
+    // Reverse motion: write PWM to the reverse pin
+    uint32_t dutyCycle = (uint32_t)(-speed * 255.0);
+    ledcWrite(forward_pin, 0);
+    ledcWrite(reverse_pin, dutyCycle);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Dual Motor Sine Wave Control Initialized.");
+
+  // --- Attach and configure each pin for PWM ---
+  // The new API combines setup and attach. No more channels needed!
+  ledcAttach(M1_FORWARD_PIN, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcAttach(M1_REVERSE_PIN, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcAttach(M2_FORWARD_PIN, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcAttach(M2_REVERSE_PIN, PWM_FREQUENCY, PWM_RESOLUTION);
+}
+
+void loop() {
+  // Calculate the current time in seconds for the sine wave calculation
+  float currentTime = millis() / 1000.0f;
+
+  // Calculate the current position (angle) in the wave cycle
+  float angle = 2 * PI * SINE_WAVE_FREQUENCY * currentTime;
+
+  // Calculate the speed for each motor using sine and cosine
+  float motor1_speed = sin(angle);
+  float motor2_speed = cos(angle);
+
+  // Apply the calculated speeds to the motors using their pin numbers
+  setMotorSpeed(M1_FORWARD_PIN, M1_REVERSE_PIN, motor1_speed);
+  setMotorSpeed(M2_FORWARD_PIN, M2_REVERSE_PIN, motor2_speed);
+
+  // (Optional) Print the speed values
+  Serial.print("Motor1:");
+  Serial.print(motor1_speed);
+  Serial.print("  Motor2:");
+  Serial.println(motor2_speed);
+
+  delay(10);
+}

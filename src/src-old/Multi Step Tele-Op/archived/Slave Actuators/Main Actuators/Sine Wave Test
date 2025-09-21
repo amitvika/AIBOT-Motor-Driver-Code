@@ -1,0 +1,159 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <math.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <ArduinoWebsockets.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_BusIO_Register.h>
+#include <Adafruit_Sensor.h>
+#include <esp_now.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+
+// I2C Pins (Hardware I2C on ESP32)
+#define SDA_PIN_SENSOR 21
+#define SCL_PIN_SENSOR 22
+
+// Motor Control Pins
+#define MOTOR_CTRL_PIN1 13
+#define MOTOR_CTRL_PIN2 14
+#define MOTOR_ENABLE_PIN 12  // Must be driven HIGH to enable the motor
+
+#define AS5600_ADDRESS 0x36
+
+// Control parameters
+uint16_t desiredPosition = 2000;  // This will be updated by the sine wave
+float kp = 5;
+int maxPWM = 255;
+int positionErrorAllowance = 2;
+int deadZone = 25;
+
+// -------------------------
+// SINE WAVE CONFIGURATION
+// -------------------------
+const uint16_t basePosition = 2000;   // Center (base) position
+float sineAmplitude = 800.0;  // Adjust this value for amplitude
+float sineSpeed = 2.0;        // Adjust this value for speed (radians per second)
+float phase = 0;
+unsigned long lastUpdateTime = 0;
+
+// -------------------------
+// AS5600 SENSOR READ FUNCTION
+// (Simplified: no jump filtering)
+// -------------------------
+uint16_t readAS5600Angle(TwoWire &wireBus) {
+  uint16_t angle = 0;
+  
+  wireBus.beginTransmission(AS5600_ADDRESS);
+  wireBus.write(0x0C);
+  if (wireBus.endTransmission(false) != 0) {
+    return 0;  // Return 0 on error
+  }
+  
+  wireBus.requestFrom(AS5600_ADDRESS, (uint8_t)2);
+  if (wireBus.available() == 2) {
+    uint8_t highByte = wireBus.read();
+    uint8_t lowByte  = wireBus.read();
+    angle = ((uint16_t)highByte << 8) | lowByte;
+    angle &= 0x0FFF;  // Only lower 12 bits are valid
+  }
+  return angle;
+}
+
+// -------------------------
+// COMPUTE PWM BASED ON POSITION ERROR
+// -------------------------
+int computeTargetPWM(uint16_t currentPosition, uint16_t desiredPosition) {
+  int error = desiredPosition - currentPosition;
+  
+  if (abs(error) <= positionErrorAllowance) {
+    return 0;
+  }
+  
+  int pwmValue = kp * error;
+  pwmValue = constrain(pwmValue, -maxPWM, maxPWM);
+  
+  // Ensure a minimum PWM (dead zone) is applied
+  if (pwmValue > 0) {
+    pwmValue = max(pwmValue, deadZone);
+  } else if (pwmValue < 0) {
+    pwmValue = min(pwmValue, -deadZone);
+  }
+  
+  return pwmValue;
+}
+
+// -------------------------
+// APPLY PWM TO THE MOTOR DRIVER
+// (Using two PWM channels)
+// -------------------------
+void applyPWM(int pwmValue, uint8_t forwardPin, uint8_t reversePin) {
+  if (pwmValue > 0) {
+    ledcWrite(0, pwmValue);
+    ledcWrite(1, 0);
+  } else if (pwmValue < 0) {
+    ledcWrite(0, 0);
+    ledcWrite(1, -pwmValue);
+  } else {
+    ledcWrite(0, 0);
+    ledcWrite(1, 0);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(MOTOR_ENABLE_PIN, OUTPUT);
+  digitalWrite(MOTOR_ENABLE_PIN, HIGH);
+
+  // Setup PWM channels at 20 kHz with 8-bit resolution
+  ledcSetup(0, 20000, 8);
+  ledcSetup(1, 20000, 8);
+  ledcAttachPin(MOTOR_CTRL_PIN1, 0);
+  ledcAttachPin(MOTOR_CTRL_PIN2, 1);
+
+  // Initialize I2C for the AS5600 sensor
+  Wire.begin(SDA_PIN_SENSOR, SCL_PIN_SENSOR);
+
+  lastUpdateTime = millis();  // Initialize timer for sine updates
+}
+
+void loop() {
+  // -------------------------
+  // SINE WAVE UPDATE SECTION
+  // -------------------------
+  unsigned long currentTime = millis();
+  float dt = (currentTime - lastUpdateTime) / 1000.0;  // Elapsed time in seconds
+  phase += sineSpeed * dt;  // Update phase based on sineSpeed
+  lastUpdateTime = currentTime;
+  
+  // Compute new desired position using the sine wave formula
+  desiredPosition = basePosition + sineAmplitude * sin(phase);
+
+  // -------------------------
+  // MOTOR CONTROL SECTION
+  // -------------------------
+  // Read the current angle from the AS5600 sensor
+  uint16_t angle = readAS5600Angle(Wire);
+  
+  // Compute the PWM value based on the error between sensor reading and desired position
+  int targetPWM = computeTargetPWM(angle, desiredPosition);
+  applyPWM(targetPWM, MOTOR_CTRL_PIN1, MOTOR_CTRL_PIN2);
+
+  // Debug output
+  int error = desiredPosition - angle;
+  Serial.print("Angle: ");
+  Serial.print(angle);
+  Serial.print(" | Desired: ");
+  Serial.print(desiredPosition);
+  Serial.print(" | Error: ");
+  Serial.print(error);
+  Serial.print(" | PWM: ");
+  Serial.println(targetPWM);
+
+  delay(10);
+}

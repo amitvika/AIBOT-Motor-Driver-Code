@@ -1,0 +1,37 @@
+#include <Arduino.h>
+#include <SimpleFOC.h>
+
+// Motor and driver parameters
+const int POLE_PAIRS = 50;
+StepperMotor motor(POLE_PAIRS);
+
+
+StepperDriver4PWM driver(37, 38, 39, 40);
+// ===================================================================
+
+// Let's start with a slow, reliable speed from the first test
+float target_velocity = 50.0f; 
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Testing with configuration from Test Case #2");
+
+  // Initialize the driver and link it to the motor
+  driver.voltage_power_supply = 25.0;
+  driver.init();
+  motor.linkDriver(&driver);
+
+  // Set a moderate voltage limit for open-loop operation
+  motor.voltage_limit = 25.0;
+  motor.controller = MotionControlType::velocity_openloop;
+
+  // Initialize the motor
+  motor.init();
+
+  Serial.println("Motor should be spinning smoothly now.");
+}
+
+void loop() {
+  // Call motor.move() as fast as possible with a constant target.
+  motor.move(target_velocity);
+}

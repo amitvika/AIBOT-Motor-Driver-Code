@@ -1,0 +1,78 @@
+#include <Arduino.h>
+
+const int center = 512;  // Assumed center value of the joystick
+const int buffer = 0;   // Buffer (deadzone) value; adjust this to change the range
+
+void setup() {
+  Serial.begin(9600);
+}
+
+void loop() {
+  // Read Joystick 1 inputs:
+  int x1 = analogRead(A4);  // X-axis for Joystick 1
+  int y1 = analogRead(A5);  // Y-axis for Joystick 1
+  int pot1 = analogRead(A7); // Linear potentiometer for Joystick 1
+  
+  // Read Joystick 2 inputs:
+  int x2 = analogRead(A0);  // X-axis for Joystick 2
+  int pot2 = analogRead(A3); // Linear potentiometer for Joystick 2
+
+  // Initialize mapped values:
+  int f = 0, b = 0, l = 0, r = 0, u = 0, d = 0, g1 = 0, g2 = 0;
+  
+  // --- Joystick 1 Mapping (X-axis) ---
+  if (x1 > center + buffer) {
+    // Map values from just above the deadzone to the maximum (0 to 100)
+    b = map(x1, center + buffer + 1, 1023, 0, 100);
+    b = constrain(b, 0, 100);
+  } else if (x1 < center - buffer) {
+    // Reversed mapping for values below the deadzone (0 to 100)
+    f = map(x1, center - buffer - 1, 0, 0, 100);
+    f = constrain(f, 0, 100);
+  }
+
+  // --- Joystick 1 Mapping (Y-axis) ---
+  if (y1 > center + buffer) {
+    l = map(y1, center + buffer + 1, 1023, 0, 100);
+    l = constrain(l, 0, 100);
+  } else if (y1 < center - buffer) {
+    r = map(y1, center - buffer - 1, 0, 0, 100);
+    r = constrain(r, 0, 100);
+  }
+  
+  // Map Joystick 1 potentiometer:
+  if (pot1 > 5) {
+    g1 = map(pot1, 5, 600, 0, 100);
+    g1 = constrain(g1, 0, 100);
+  }
+  
+  // --- Joystick 2 Mapping (X-axis) ---
+  if (x2 > center + buffer) {
+    u = map(x2, center + buffer + 1, 1023, 0, 100);
+    u = constrain(u, 0, 100);
+  } else if (x2 < center - buffer) {
+    d = map(x2, center - buffer - 1, 0, 0, 100);
+    d = constrain(d, 0, 100);
+  }
+  
+  // Map Joystick 2 potentiometer:
+  if (pot2 > 5) {
+    g2 = map(pot2, 5, 600, 0, 100);
+    g2 = constrain(g2, 0, 100);
+  }
+  
+  // Create the output string in the desired format:
+  String output = "f=" + String(f) + 
+                  ";b=" + String(b) + 
+                  ";l=" + String(l) + 
+                  ";r=" + String(r) + 
+                  ";u=" + String(d) + 
+                  ";d=" + String(u) + 
+                  ";g1=" + String(g1) + 
+                  ";g2=" + String(g2);
+  
+  // Print the output string:
+  Serial.println(output);
+  
+  delay(50);
+}

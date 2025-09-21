@@ -1,0 +1,99 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_BusIO_Register.h>
+#include <Adafruit_Sensor.h>
+#include <HTTPClient.h>
+#include <math.h> // for roundf()
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+
+// ------------------- UART CONFIG -------------------
+#define UART_BAUD_RATE   115200  // Adjust as needed
+#define MAX_LINE_LENGTH  256
+#define UART_TX_PIN      17
+#define UART_RX_PIN      16
+
+// Use Serial1 for UART communication with the RPi.
+Stream* commPort;
+
+// ------------------- TARGET (Actuator 6) MAC ADDRESS -------------------
+// Actuator 6 MAC address: {0xF8, 0xB3, 0xB7, 0xD2, 0x3B, 0x68}
+uint8_t actuator6MAC[] = { 0xF8, 0xB3, 0xB7, 0xD2, 0x3B, 0x68 };
+
+
+// Minimal ESP‑NOW send callback.
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  // Intentionally empty for minimal overhead.
+}
+
+void setup() {
+  // Optional: You can comment out Serial.begin if you want no printing at all.
+  Serial.begin(115200);
+  delay(100);
+
+  // Initialize UART (Serial1) for communication with the RPi.
+  Serial1.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+  commPort = &Serial1;
+  
+  // Set WiFi to station mode and disable power saving.
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.disconnect();
+
+  // Initialize ESP‑NOW.
+  if (esp_now_init() != ESP_OK) {
+    // If initialization fails, do nothing.
+  }
+  esp_now_register_send_cb(onDataSent);
+  
+  // Add only the actuator6 peer.
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, actuator6MAC, 6);
+  peerInfo.channel = 0;  // Use the same channel as the master.
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+}
+
+void loop() {
+  static char buffer[MAX_LINE_LENGTH];
+  static int idx = 0;
+  
+  // Read available characters from the UART.
+  while (commPort->available() > 0) {
+    char c = (char)commPort->read();
+    
+    // When a newline is encountered, terminate the buffer and send it.
+    if (c == '\n') {
+      buffer[idx] = '\0';
+      if (idx > 0) {
+        // Send the received string to actuator6.
+        esp_now_send(actuator6MAC, (uint8_t*)buffer, idx + 1);
+      }
+      idx = 0;
+    } 
+    else {
+      // Accumulate characters until newline or buffer overflow.
+      if (idx < (MAX_LINE_LENGTH - 1)) {
+        buffer[idx++] = c;
+      } else {  
+        idx = 0;  // Reset if buffer overflows.
+      }
+    }
+  }
+  // Loop continuously with no delay.
+}

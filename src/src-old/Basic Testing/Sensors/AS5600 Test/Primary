@@ -1,0 +1,54 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <ArduinoWebsockets.h>
+#include <ArduinoJson.h>
+#include <Arduino.h>
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_BusIO_Register.h>
+ #include <Adafruit_Sensor.h>
+
+// Use hardware I2C pins on ESP32:
+// SDA = 21, SCL = 22
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// AS5600 I2C address
+#define AS5600_ADDRESS 0x36
+
+// Reads and returns the 12-bit angle value from the AS5600 sensor
+uint16_t readAS5600Angle() {
+  // Point to the angle register (0x0C = high byte, then next byte = low byte)
+  Wire.beginTransmission(AS5600_ADDRESS);
+  Wire.write(0x0C); 
+  Wire.endTransmission(false);
+
+  // Request 2 bytes from the sensor
+  Wire.requestFrom(AS5600_ADDRESS, (uint8_t)2);
+  
+  if (Wire.available() == 2) {
+    // Read the two bytes
+    uint8_t highByte = Wire.read();
+    uint8_t lowByte  = Wire.read();
+
+    // Combine them into one 16-bit number (only the lower 12 bits are valid)
+    uint16_t angle = ((uint16_t)highByte << 8) | lowByte;
+    return (angle & 0x0FFF);
+  }
+  
+  // If we failed to read, return 0 or handle the error as needed
+  return 0;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);  // Just to stabilize Serial output
+  Wire.begin(SDA_PIN, SCL_PIN); // Initialize I2C on pins 21 (SDA) and 22 (SCL)
+}
+
+void loop() {
+  uint16_t angle = readAS5600Angle();
+  Serial.println(angle);
+  delay(500);  // Adjust read/print rate as desired
+}

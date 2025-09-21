@@ -1,0 +1,233 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+
+#include <Wire.h>
+#include <Adafruit_BusIO_Register.h>
+#include <Adafruit_Sensor.h>
+#include <HTTPClient.h>
+#include <math.h> // for roundf()
+#include <Arduino.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+
+#include <Wire.h>
+#include <Adafruit_BusIO_Register.h>
+#include <Adafruit_Sensor.h>
+#include <HTTPClient.h>
+#include <math.h>
+#include <string.h>
+
+// ------------------------- PIN DEFINITIONS -------------------------
+#define SDA_PIN_SENSOR   21
+#define SCL_PIN_SENSOR   22
+#define MOTOR_CTRL_PIN1  13
+#define MOTOR_CTRL_PIN2  14
+#define MOTOR_ENABLE_PIN 12 //12 on 5 off
+#define AS5600_ADDRESS   0x36
+#define ACTUATOR_CENTER 2354  // Use 3750 as the working center position if needed
+
+// ---------------------- CONTROL PARAMETERS -------------------------
+uint16_t desiredPosition = ACTUATOR_CENTER;  // Initialize desired position at virtual zero
+float kp = 0.3;
+int maxPWM = 255;
+int positionErrorAllowance = 1;
+int deadZone = 20;
+
+// ------------------- DIRECTION INVERSION VARIABLE -------------------------
+bool invertDirection = true; // Set to true to enable direction inversion
+
+// ------------------- MOTION LIMITS -------------------------
+// Define safe operating limits for the sensor angle.
+const uint16_t ANGLE_MIN = 1000;
+const uint16_t ANGLE_MAX = 3721;
+
+// ------------------- REMAP FUNCTION ---------------------
+// Remaps a working position value to the actual sensor position,
+// treating ACTUATOR_CENTER as the virtual zero.
+// The direction is inverted if 'invertDirection' is true.
+uint16_t remapPosition(uint16_t workingPosition) {
+  // 4096 counts per revolution (0 to 4095)
+  if (invertDirection) {
+    int temp = ACTUATOR_CENTER - workingPosition;
+    if (temp < 0) {
+      temp += 4096;
+    }
+    return (uint16_t)(temp % 4096);
+  } else {
+    return (ACTUATOR_CENTER + workingPosition) % 4096;
+  }
+}
+
+// --------------------- READ AS5600 ANGLE ---------------------------
+// Reads the 12-bit angle from the AS5600 sensor.
+uint16_t readAS5600Angle() {
+  Wire.beginTransmission(AS5600_ADDRESS);
+  Wire.write(0x0C);
+  Wire.endTransmission(false);
+  Wire.requestFrom(AS5600_ADDRESS, (uint8_t)2);
+  if (Wire.available() == 2) {
+    uint8_t highByte = Wire.read();
+    uint8_t lowByte  = Wire.read();
+    uint16_t angle   = ((uint16_t)highByte << 8) | lowByte;
+    return (angle & 0x0FFF);
+  }
+  return 0;
+}
+
+// ------------------ WRAP-AROUND DIFFERENCE FUNCTION ----------------
+// Ensures angular difference is in [-2048, 2047].
+int angleDifference(uint16_t currentAngle, uint16_t targetAngle) {
+  int diff = (int)targetAngle - (int)currentAngle;
+  if (diff > 2047) {
+    diff -= 4096; 
+  } else if (diff < -2048) {
+    diff += 4096;
+  }
+  return diff;
+}
+
+// ------------------ MOTOR CONTROL FUNCTIONS ------------------------
+// Compute a PWM output based on the error between current and desired positions.
+int computeTargetPWM(uint16_t currentPosition, uint16_t desiredPosition) {
+  int error = angleDifference(currentPosition, desiredPosition);
+  if (abs(error) <= positionErrorAllowance) {
+    return 0;
+  }
+  int pwmValue = kp * error;
+  pwmValue = constrain(pwmValue, -maxPWM, maxPWM);
+  // Ensure the output exceeds the dead zone.
+  if (pwmValue > 0) {
+    pwmValue = max(pwmValue, deadZone);
+  } else if (pwmValue < 0) {
+    pwmValue = min(pwmValue, -deadZone);
+  }
+  return pwmValue;
+}
+
+// Apply the computed PWM to the motor using two LEDC channels.
+void applyPWM(int pwmValue) {
+  if (pwmValue > 0) {
+    ledcWrite(0, pwmValue);
+    ledcWrite(1, 0);
+  } else if (pwmValue < 0) {
+    ledcWrite(0, 0);
+    ledcWrite(1, -pwmValue);
+  } else {
+    ledcWrite(0, 0);
+    ledcWrite(1, 0);
+  }
+}
+
+// ------------------- Setup PWM Pins and Channels -------------------
+void setupPinsAndPWMs() {
+  pinMode(MOTOR_ENABLE_PIN, OUTPUT);
+  digitalWrite(MOTOR_ENABLE_PIN, HIGH);
+  pinMode(MOTOR_CTRL_PIN1, OUTPUT);
+  pinMode(MOTOR_CTRL_PIN2, OUTPUT);
+  ledcSetup(0, 20000, 8); // Channel 0 for one motor direction.
+  ledcSetup(1, 20000, 8); // Channel 1 for the other direction.
+  ledcAttachPin(MOTOR_CTRL_PIN1, 0);
+  ledcAttachPin(MOTOR_CTRL_PIN2, 1);
+  ledcWrite(0, 0);
+  ledcWrite(1, 0);
+}
+
+// ------------------- ESP-NOW RECEIVE CODE --------------------------
+#define MAX_BUFFER_SIZE 256
+void parseActuatorValueLine(char* line);
+
+void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
+  if (len <= 0) return;
+  char buffer[MAX_BUFFER_SIZE];
+  int copyLen = (len < MAX_BUFFER_SIZE - 1) ? len : MAX_BUFFER_SIZE - 1;
+  memcpy(buffer, incomingData, copyLen);
+  buffer[copyLen] = '\0';
+  Serial.print("Received via ESP-NOW: ");
+  Serial.println(buffer);
+  parseActuatorValueLine(buffer);
+}
+
+// Parse key/value string and update desiredPosition if key "h1Y" is found.
+void parseActuatorValueLine(char* line) {
+  char* token = strtok(line, ";");
+  while (token != NULL) {
+    char* eqPos = strchr(token, '=');
+    if (eqPos) {
+      *eqPos = '\0';
+      char* key = token;
+      char* val = eqPos + 1;
+      if (strcmp(key, "h1Y") == 0) {
+        // Get the raw working position from the received string.
+        uint16_t workingPosition = (uint16_t)atoi(val);
+        Serial.print("Raw working position received: ");
+        Serial.println(workingPosition);
+        
+        // Remap the working position to the actual sensor position.
+        desiredPosition = remapPosition(workingPosition);
+        
+        // Clamp desiredPosition to safe limits.
+        if (desiredPosition > ANGLE_MAX) {
+          desiredPosition = ANGLE_MAX;
+        } else if (desiredPosition < ANGLE_MIN) {
+          desiredPosition = ANGLE_MIN;
+        }
+        Serial.print("Updated desiredPosition (remapped h1Y): ");
+        Serial.println(desiredPosition);
+      }
+    }
+    token = strtok(NULL, ";");
+  }
+}
+
+// ------------------- ESP-NOW SETUP ---------------------------------
+void initESPNOW() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+  }
+  esp_now_register_recv_cb(onDataRecv);
+}
+
+// ------------------------------ SETUP ------------------------------
+void setup() {
+  Serial.begin(115200);
+  delay(100); // Allow time for the serial connection to initialize
+  Serial.println("Starting ESP-NOW Motor Controller Receiver...");
+  setupPinsAndPWMs();
+  Wire.begin(SDA_PIN_SENSOR, SCL_PIN_SENSOR);
+  initESPNOW();
+  Serial.print("Receiver MAC Address: ");
+  Serial.println(WiFi.macAddress());
+}
+
+// ------------------------------ LOOP -------------------------------
+void loop() {
+  uint16_t angle = readAS5600Angle();
+  int targetPWM  = computeTargetPWM(angle, desiredPosition);
+
+  // Prevent actuator motion beyond safe limits.
+  if ((angle >= ANGLE_MAX && targetPWM > 0) || (angle <= ANGLE_MIN && targetPWM < 0)) {
+    targetPWM = 0;
+  }
+
+  applyPWM(targetPWM);
+
+  Serial.print("Angle: ");
+  Serial.print(angle);
+  Serial.print(" | Setpoint: ");
+  Serial.print(desiredPosition);
+  Serial.print(" | PWM: ");
+  Serial.println(targetPWM);
+  
+  delay(10);  // Adjust delay as needed for stable control loop timing.
+}

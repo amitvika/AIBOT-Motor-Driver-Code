@@ -1,0 +1,190 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+ #include <WiFiClientSecure.h>
+ #include <HTTPClient.h>
+#include <Arduino.h>
+#include <Wire.h>
+#include <Arduino.h>
+#include <Wire.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_now.h>
+
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Wire.h>
+
+#include <SPI.h>
+
+#include <esp_wifi.h> // Include this for Wi-Fi channel setting
+
+
+// Define the MAC addresses of both ESP32 devices
+const uint8_t ESP32_1_MAC[] = {0xd4, 0x8a, 0xfc, 0xc9, 0x1f, 0x30};
+const uint8_t ESP32_2_MAC[] = {0x78, 0xee, 0x4c, 0x11, 0x31, 0x8c};
+
+// Replace with your desired channel (must be the same for both devices)
+const int WIFI_CHANNEL = 1;
+
+// Structure to hold the message
+typedef struct struct_message {
+    char msg[50];
+} struct_message;
+
+// Create message objects
+struct_message incomingMessage;
+struct_message outgoingMessage;
+
+// Global variable to store the peer's MAC address
+const uint8_t *peer_mac = nullptr;
+
+// Forward declarations
+void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len);
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
+
+void setup() {
+    // Initialize Serial Monitor
+    Serial.begin(115200);
+    Serial.println("ESP-NOW Test");
+
+    // Initialize WiFi in AP+STA mode
+    WiFi.mode(WIFI_AP_STA);
+    Serial.print("Device MAC Address: ");
+    Serial.println(WiFi.macAddress());
+
+    // Set the Wi-Fi channel
+    if (esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
+        Serial.println("Failed to set Wi-Fi channel");
+    } else {
+        Serial.print("Wi-Fi Channel set to: ");
+        Serial.println(WIFI_CHANNEL);
+    }
+
+    // Initialize ESP-NOW
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("Error initializing ESP-NOW");
+        return;
+    }
+
+    // Register the send and receive callbacks
+    esp_now_register_send_cb(OnDataSent);
+    esp_now_register_recv_cb(OnDataRecv);
+
+    // Determine the peer's MAC address based on this device's MAC
+    uint8_t own_mac[6];
+    esp_read_mac(own_mac, ESP_MAC_WIFI_STA);
+    bool isESP32_1 = true;
+    for (int i = 0; i < 6; i++) {
+        if (own_mac[i] != ESP32_1_MAC[i]) {
+            isESP32_1 = false;
+            break;
+        }
+    }
+
+    if (isESP32_1) {
+        peer_mac = ESP32_2_MAC;
+        Serial.println("This is ESP32_1. Setting peer to ESP32_2.");
+    } else {
+        // Check if it matches ESP32_2's MAC
+        bool isESP32_2 = true;
+        for (int i = 0; i < 6; i++) {
+            if (own_mac[i] != ESP32_2_MAC[i]) {
+                isESP32_2 = false;
+                break;
+            }
+        }
+        if (isESP32_2) {
+            peer_mac = ESP32_1_MAC;
+            Serial.println("This is ESP32_2. Setting peer to ESP32_1.");
+        } else {
+            Serial.println("Unknown device. Please check the MAC addresses.");
+            return;
+        }
+    }
+
+    // Add the peer
+    esp_now_peer_info_t peerInfo;
+    memcpy(peerInfo.peer_addr, peer_mac, 6);
+    peerInfo.channel = WIFI_CHANNEL; // Optional: Can be removed if issues persist
+    peerInfo.encrypt = false;
+
+    if (esp_now_add_peer(&peerInfo) != ESP_OK){
+        Serial.println("Failed to add peer");
+        return;
+    }
+
+    Serial.println("Peer added successfully");
+
+    // Prepare the outgoing message
+    sprintf(outgoingMessage.msg, "Hello from %s", isESP32_1 ? "ESP32_1" : "ESP32_2");
+}
+
+unsigned long lastSendTime = 0;
+const unsigned long sendInterval = 2000; // 2 seconds
+
+void loop() {
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastSendTime > sendInterval) {
+        lastSendTime = currentMillis;
+        if (peer_mac != nullptr) {
+            // Send the message
+            esp_err_t result = esp_now_send(peer_mac, (uint8_t *) &outgoingMessage, sizeof(outgoingMessage));
+            if (result == ESP_OK) {
+                Serial.println("Message sent successfully");
+            } else {
+                Serial.print("Error sending the message: ");
+                Serial.println(result);
+                // Optionally, attempt to re-add the peer if not found
+                if (result == ESP_ERR_ESPNOW_NOT_FOUND) {
+                    Serial.println("Peer not found. Attempting to re-add peer.");
+                    esp_now_peer_info_t peerInfo;
+                    memcpy(peerInfo.peer_addr, peer_mac, 6);
+                    peerInfo.channel = WIFI_CHANNEL; // Ensure channel matches
+                    peerInfo.encrypt = false;
+
+                    if (esp_now_add_peer(&peerInfo) == ESP_OK){
+                        Serial.println("Peer re-added successfully");
+                    } else {
+                        Serial.println("Failed to re-add peer");
+                    }
+                }
+            }
+        } else {
+            Serial.println("Peer MAC address not set.");
+        }
+    }
+}
+
+// Callback when data is received
+void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    Serial.print("Data received from: ");
+    Serial.println(macStr);
+
+    memcpy(&incomingMessage, incomingData, sizeof(incomingMessage));
+    Serial.printf("Message: %s\n", incomingMessage.msg);
+}
+
+// Callback when data is sent
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+    Serial.print("Last Packet Sent to: ");
+    Serial.println(macStr);
+    Serial.print("Send Status: ");
+    if (status == ESP_NOW_SEND_SUCCESS) {
+        Serial.println("Success");
+    } else {
+        Serial.println("Failure");
+    }
+}

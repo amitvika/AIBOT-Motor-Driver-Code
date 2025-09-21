@@ -1,0 +1,457 @@
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <ArduinoWebsockets.h>
+#include <Wire.h>
+
+using namespace websockets;
+
+// --------------------- Configuration ---------------------
+#define JOINT_INDEX 0 // Change this per actuator. For J1 actuator use 0, J2 actuator use 1, etc.
+
+// Wi-Fi credentials
+const char* ssid = "The Best Is Yet To Come!";
+const char* password = "blessings1";
+
+// WebSocket server address
+const char* websocketServer = "ws://64.225.55.176:8765";
+
+// --------------------- DH Parameters and IK Structures ---------------------
+struct DHParameter {
+    double a;
+    double alpha;
+    double d;
+    double theta;
+};
+
+DHParameter dh_params[6] = {
+    { 0.0,     M_PI/2,   140.0, 0 },   // Link 1
+    { 400.0,   0,        0.0,   0 },   // Link 2
+    { 250.0,   0,        0.0,   0 },   // Link 3
+    { 0.0,     M_PI/2,   0.0,   0 },   // Link 4
+    { 100.0,  -M_PI/2,   0.0,   0 },   // Link 5
+    { 100.0,   M_PI/2,   25.0,  0 }    // Link 6
+};
+
+// --------------------- Kalman Filter for Joint Angles ---------------------
+// Simple 1D Kalman filter for each joint angle
+struct KalmanFilter {
+    double x;  // estimated value
+    double P;  // estimation error covariance
+    double Q;  // process noise variance
+    double R;  // measurement noise variance
+};
+
+static KalmanFilter jointFilters[6];
+
+// Initialize all Kalman filters
+void initKalmanFilters() {
+    for (int i = 0; i < 6; i++) {
+        jointFilters[i].x = 0.0;
+        jointFilters[i].P = 1.0;
+        jointFilters[i].Q = 0.001; // process noise
+        jointFilters[i].R = 0.01;  // measurement noise
+    }
+}
+
+// Perform a single Kalman update step for a given joint measurement
+double kalmanUpdate(KalmanFilter &kf, double measurement) {
+    // Prediction step: x_pred = x, P_pred = P + Q
+    double P_pred = kf.P + kf.Q;
+
+    // Update step:
+    double K = P_pred / (P_pred + kf.R); // Kalman gain
+    double x_new = kf.x + K * (measurement - kf.x);
+    double P_new = (1 - K) * P_pred;
+
+    kf.x = x_new;
+    kf.P = P_new;
+
+    return kf.x;
+}
+
+// --------------------- WebSocket Client ---------------------
+WebsocketsClient webSocket;
+
+// --------------------- Filtered Joint Angles ---------------------
+static double filtered_joint_angles[6] = {0, 0, 0, 0, 0, 0};
+
+// --------------------- Sensor and Motor Control ---------------------
+#define AS5600_ADDRESS 0x36
+
+// I2C Pins for Sensor
+#define SDA_PIN_SENSOR 18
+#define SCL_PIN_SENSOR 19
+
+// Motor Control Pins
+#define MOTOR_CTRL_PIN1 22
+#define MOTOR_CTRL_PIN2 25
+
+// Desired position for this actuator
+uint16_t desiredPosition = 2000; // This will be updated from the joint angle
+
+// Control parameters
+float kp = 0.5;
+int maxPWM = 255;
+int positionErrorAllowance = 1;
+int deadZone = 5;
+
+// Sensor reading validation
+uint16_t lastValidAngle = 2000; 
+const uint16_t maxAllowedJump = 5000; 
+
+// --------------------- Function Prototypes ---------------------
+void onWebSocketEvent(WebsocketsEvent event, String data);
+bool inverseKinematics(double x, double y, double z, double pitch, double yaw, double roll, double joint_angles[6]);
+void computeRotationMatrix03(double joint_angles[3], double R0_3[3][3]);
+void eulerZYXToRotationMatrix(double roll, double pitch, double yaw, double R[3][3]);
+void multiplyTransposeMatrix(double A[3][3], double B[3][3], double result[3][3]);
+void multiplyMatrices3x3(double A[3][3], double B[3][3], double result[3][3]);
+uint16_t readAS5600Angle(TwoWire &wireBus, uint16_t &lastValidAngle);
+void controlMotor(uint16_t currentPosition, uint16_t desiredPosition, uint8_t forwardPin, uint8_t reversePin);
+
+// --------------------- WebSocket Event Handler ---------------------
+void onWebSocketEvent(WebsocketsEvent event, String data) {
+    if(event == WebsocketsEvent::ConnectionOpened) {
+        Serial.println("WebSocket Connection Opened");
+        webSocket.send("{\"type\": \"robot\"}");
+    } 
+    else if(event == WebsocketsEvent::ConnectionClosed) {
+        Serial.println("WebSocket Connection Closed, attempting to reconnect");
+        webSocket.connect(websocketServer);
+    } 
+    else if(event == WebsocketsEvent::GotPing) {
+        Serial.println("Received ping from server");
+        webSocket.send("pong");
+    } 
+    else if(event == WebsocketsEvent::GotPong) {
+        Serial.println("Received pong from server");
+    }
+}
+
+// --------------------- Setup ---------------------
+void setup() {
+    Serial.begin(115200);
+    delay(100);
+
+    // Connect to Wi-Fi
+    Serial.println("Connecting to Wi-Fi...");
+    WiFi.begin(ssid, password);
+    unsigned long wifiConnectStart = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        if (millis() - wifiConnectStart > 5000) {
+            Serial.println("\nFailed to connect to Wi-Fi, restarting...");
+            ESP.restart();
+        }
+        delay(100);
+        Serial.print(".");
+    }
+    Serial.println("\nConnected to Wi-Fi");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    // Set WebSocket event handler
+    webSocket.onEvent(onWebSocketEvent);
+
+    // Set WebSocket message handler
+    webSocket.onMessage([](WebsocketsMessage message) {
+        if (message.isText()) {
+            String data = message.data();
+            StaticJsonDocument<512> doc; 
+            DeserializationError error = deserializeJson(doc, data);
+
+            if (!error) {
+                double x = doc["position"]["x"].as<double>();
+                double y = doc["position"]["y"].as<double>();
+                double z = doc["position"]["z"].as<double>();
+                double pitch = doc["orientation"]["pitch"].as<double>();
+                double yaw   = doc["orientation"]["yaw"].as<double>();
+                double roll  = doc["orientation"]["roll"].as<double>();
+
+                // Convert orientation from degrees to radians
+                pitch = pitch * PI / 180.0;
+                yaw   = yaw   * PI / 180.0;
+                roll  = roll  * PI / 180.0;
+
+                double joint_angles[6];
+                if (inverseKinematics(x, y, z, pitch, yaw, roll, joint_angles)) {
+                    // Update each joint angle with Kalman filter
+                    for (int i = 0; i < 6; ++i) {
+                        filtered_joint_angles[i] = kalmanUpdate(jointFilters[i], joint_angles[i]);
+                    }
+
+                    // Convert the chosen joint angle to [0, 4095] range
+                    int angle_int = (int)(filtered_joint_angles[JOINT_INDEX] * (4096.0 / (2.0 * PI)));
+                    angle_int = (angle_int + 4096) % 4096;
+
+                    // Update desired position for this actuator
+                    desiredPosition = angle_int;
+
+                    Serial.printf("Updated Desired Position for Joint %d: %d\n", JOINT_INDEX+1, desiredPosition);
+                } else {
+                    // No valid IK solution
+                    Serial.println("IK failed, no valid solution.");
+                }
+            } else {
+                Serial.print("deserializeJson() failed: ");
+                Serial.println(error.c_str());
+            }
+        }
+    });
+
+    // Connect to WebSocket server
+    bool connected = webSocket.connect(websocketServer);
+    if (connected) {
+        Serial.println("Connected to WebSocket server");
+    } else {
+        Serial.println("Failed to connect to WebSocket server, will attempt to reconnect");
+    }
+
+    // Initialize I2C for sensor
+    Wire.begin(SDA_PIN_SENSOR, SCL_PIN_SENSOR);
+
+    pinMode(32, INPUT_PULLUP);
+    pinMode(16, INPUT_PULLUP);
+    pinMode(21, INPUT_PULLUP);
+    pinMode(4, INPUT_PULLDOWN);
+
+    // Configure motor control pins
+    pinMode(MOTOR_CTRL_PIN1, OUTPUT);
+    pinMode(MOTOR_CTRL_PIN2, OUTPUT);
+
+    // Initialize Kalman filters for all joints
+    initKalmanFilters();
+}
+
+// --------------------- Loop ---------------------
+void loop() {
+    // Handle WebSocket events
+    webSocket.poll();
+
+    // Read current angle from sensor
+    uint16_t angle = readAS5600Angle(Wire, lastValidAngle);
+
+    // Compute the minimal angular difference (error) considering wrap-around
+    const int fullRange = 4096;
+    const int halfRange = fullRange / 2;
+
+    int error = (int)desiredPosition - (int)angle;
+    error = (error + halfRange) % fullRange - halfRange;  // Wrap-around correction
+
+    // Track previous values to only print when there's an update
+    static uint16_t lastPrintedAngle = 0xFFFF;       // Use invalid initial value
+    static uint16_t lastPrintedDesired = 0xFFFF;     // Use invalid initial value
+    static int lastPrintedError = 0xFFFF;            // Use invalid initial value
+
+    if (angle != lastPrintedAngle || desiredPosition != lastPrintedDesired || error != lastPrintedError) {
+        // Uncomment if you want debugging info
+        // Serial.print("Sensor angle: ");
+        // Serial.print(angle);
+        // Serial.print(" Desired: ");
+        // Serial.print(desiredPosition);
+        // Serial.print(" Error: ");
+        // Serial.println(error);
+
+        lastPrintedAngle = angle;
+        lastPrintedDesired = desiredPosition;
+        lastPrintedError = error;
+    }
+
+    // Control the motor based on the difference between current and desired positions
+    controlMotor(angle, desiredPosition, MOTOR_CTRL_PIN1, MOTOR_CTRL_PIN2);
+
+    delay(10);
+}
+
+
+// --------------------- AS5600 Sensor Reading ---------------------
+uint16_t readAS5600Angle(TwoWire &wireBus, uint16_t &lastValidAngle) {
+    uint16_t angle = 0;
+    wireBus.beginTransmission(AS5600_ADDRESS);
+    wireBus.write(0x0C); // Register address for 'ANGLE'
+    if (wireBus.endTransmission(false) != 0) {
+        Serial.println("Error: Sensor not responding. Using last valid reading.");
+        return lastValidAngle;
+    }
+
+    wireBus.requestFrom(AS5600_ADDRESS, (uint8_t)2);
+    if (wireBus.available() == 2) {
+        uint8_t highByte = wireBus.read();
+        uint8_t lowByte = wireBus.read();
+        angle = ((uint16_t)highByte << 8) | lowByte;
+        angle = angle & 0x0FFF; // 12-bit value
+
+        // Validate new reading
+        if (abs((int)angle - (int)lastValidAngle) > maxAllowedJump) {
+            Serial.println("Warning: Sudden jump detected. Ignoring invalid reading.");
+            return lastValidAngle; 
+        }
+
+        lastValidAngle = angle; 
+    } else {
+        Serial.println("Error: Incomplete data received. Using last valid reading.");
+        return lastValidAngle;
+    }
+
+    return angle;
+}
+
+// --------------------- Motor Control ---------------------
+void controlMotor(uint16_t currentPosition, uint16_t desiredPosition, uint8_t forwardPin, uint8_t reversePin) {
+    // Define the full range and half range for a 12-bit sensor
+    const int fullRange = 4096;
+    const int halfRange = fullRange / 2;
+
+    // Compute the minimal angular difference (error) considering wrap-around
+    int error = (int)desiredPosition - (int)currentPosition;
+    error = (error + halfRange) % fullRange - halfRange;  // Wrap-around correction
+
+    if (abs(error) <= positionErrorAllowance) {
+        // Stop the motor if within allowable error
+        analogWrite(forwardPin, 0);
+        analogWrite(reversePin, 0);
+        return;
+    }
+
+    // Compute PWM based on the proportional gain
+    int pwmValue = (int)(kp * error);
+    pwmValue = constrain(pwmValue, -maxPWM, maxPWM);
+
+    if (pwmValue > 0) {
+        // Ensure we exceed the deadZone to get the motor moving forward
+        pwmValue = max(pwmValue, deadZone);
+        analogWrite(forwardPin, pwmValue);
+        analogWrite(reversePin, 0);
+    } else if (pwmValue < 0) {
+        // Ensure we exceed the negative deadZone to get the motor moving backward
+        pwmValue = min(pwmValue, -deadZone);
+        analogWrite(forwardPin, 0);
+        analogWrite(reversePin, -pwmValue);
+    } else {
+        // No movement needed
+        analogWrite(forwardPin, 0);
+        analogWrite(reversePin, 0);
+    }
+}
+
+// --------------------- Inverse Kinematics ---------------------
+bool inverseKinematics(double x, double y, double z, double pitch, double yaw, double roll, double joint_angles[6]) {
+    double d6 = dh_params[5].d; 
+
+    double R_end[3][3];
+    eulerZYXToRotationMatrix(roll, pitch, yaw, R_end);
+
+    double wx = x - d6 * R_end[0][2];
+    double wy = y - d6 * R_end[1][2];
+    double wz = z - d6 * R_end[2][2];
+
+    joint_angles[0] = atan2(wy, wx);
+
+    double a1 = dh_params[0].a;
+    double d1 = dh_params[0].d;
+    double a2 = dh_params[1].a;
+    double a3 = dh_params[2].a;
+
+    double r = sqrt(wx * wx + wy * wy) - a1; 
+    double s = wz - d1;
+
+    double D = (r * r + s * s - a2 * a2 - a3 * a3) / (2 * a2 * a3);
+
+    if (fabs(D) > 1.0) {
+        return false; 
+    }
+
+    double theta3 = atan2(-sqrt(1 - D * D), D);
+    joint_angles[2] = theta3;
+
+    double theta2 = atan2(s, r) - atan2(a3 * sin(theta3), a2 + a3 * cos(theta3));
+    joint_angles[1] = theta2;
+
+    double R0_3[3][3];
+    computeRotationMatrix03(joint_angles, R0_3);
+
+    double R3_6[3][3];
+    multiplyTransposeMatrix(R0_3, R_end, R3_6);
+
+    joint_angles[3] = atan2(R3_6[1][2], R3_6[0][2]);
+    joint_angles[4] = atan2(sqrt(R3_6[0][2]*R3_6[0][2] + R3_6[1][2]*R3_6[1][2]), R3_6[2][2]);
+    joint_angles[5] = atan2(R3_6[2][1], -R3_6[2][0]);
+
+    return true;
+}
+
+void computeRotationMatrix03(double joint_angles[3], double R0_3[3][3]) {
+    double theta1 = joint_angles[0];
+    double theta2 = joint_angles[1];
+    double theta3 = joint_angles[2];
+
+    double c1 = cos(theta1), s1 = sin(theta1);
+    double c2 = cos(theta2), s2 = sin(theta2);
+    double c3 = cos(theta3), s3 = sin(theta3);
+
+    double alpha1 = dh_params[0].alpha;
+    double alpha2 = dh_params[1].alpha;
+    double alpha3 = dh_params[2].alpha;
+
+    double R0_1[3][3] = {
+        { c1, -s1*cos(alpha1),  s1*sin(alpha1) },
+        { s1,  c1*cos(alpha1), -c1*sin(alpha1) },
+        { 0,   sin(alpha1),     cos(alpha1)    }
+    };
+
+    double R1_2[3][3] = {
+        { c2, -s2*cos(alpha2),  s2*sin(alpha2) },
+        { s2,  c2*cos(alpha2), -c2*sin(alpha2) },
+        { 0,   sin(alpha2),     cos(alpha2)    }
+    };
+
+    double R2_3[3][3] = {
+        { c3, -s3*cos(alpha3),  s3*sin(alpha3) },
+        { s3,  c3*cos(alpha3), -c3*sin(alpha3) },
+        { 0,   sin(alpha3),     cos(alpha3)    }
+    };
+
+    double R0_2[3][3];
+    multiplyMatrices3x3(R0_1, R1_2, R0_2);
+    multiplyMatrices3x3(R0_2, R2_3, R0_3);
+}
+
+void eulerZYXToRotationMatrix(double roll, double pitch, double yaw, double R[3][3]) {
+    double cr = cos(roll);
+    double sr = sin(roll);
+    double cp = cos(pitch);
+    double sp = sin(pitch);
+    double cy = cos(yaw);
+    double sy = sin(yaw);
+
+    R[0][0] = cy * cp;
+    R[0][1] = cy * sp * sr - sy * cr;
+    R[0][2] = cy * sp * cr + sy * sr;
+
+    R[1][0] = sy * cp;
+    R[1][1] = sy * sp * sr + cy * cr;
+    R[1][2] = sy * sp * cr - cy * sr;
+
+    R[2][0] = -sp;
+    R[2][1] = cp * sr;
+    R[2][2] = cp * cr;
+}
+
+void multiplyTransposeMatrix(double A[3][3], double B[3][3], double result[3][3]) {
+    double At[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            At[i][j] = A[j][i];
+
+    multiplyMatrices3x3(At, B, result);
+}
+
+void multiplyMatrices3x3(double A[3][3], double B[3][3], double result[3][3]) {
+    for(int i = 0; i < 3; ++i) {
+        for(int j = 0; j < 3; ++j) {
+            result[i][j] = 0;
+            for(int k = 0; k < 3; ++k)
+                result[i][j] += A[i][k] * B[k][j];
+        }
+    }
+}

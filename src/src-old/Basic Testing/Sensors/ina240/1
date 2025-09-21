@@ -1,0 +1,57 @@
+#include <Arduino.h>
+
+//-- ⚙️ Pin Definitions from your Schematic --//
+const int CURRENT_SENSE_PIN_1 = 8;  // From INA240 (U6) -> SENSE[3C]_C2
+const int CURRENT_SENSE_PIN_2 = 9;  // From INA240 (U8) -> SENSE[3B]_C3
+const int VOLTAGE_ADC_PIN = 10;     // General ADC input -> POWER[3C]_VOLT_ADC
+
+//-- Sensor and ADC Configuration --//
+const float ADC_MAX_VALUE = 4095.0; // ESP32 has a 12-bit ADC (2^12 - 1)
+const float ADC_VREF = 3.3;         // ADC reference voltage is typically 3.3V
+const float INA240_GAIN = 50.0;     // The "A2" version of INA240 has a gain of 50 V/V
+
+//-- ⚠️ IMPORTANT: UPDATE THIS VALUE --//
+// This is an assumption. Find the value of the large, low-resistance
+// shunt resistor on your board for accurate current readings.
+const float SENSE_RESISTOR_OHMS = 0.001; // Placeholder of 1 milliOhm (0.001 Ohms)
+
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+  Serial.println("--- Current Sensor Reading Test ---");
+  Serial.println("Reading values from GPIO 8 and GPIO 9.");
+  Serial.println();
+  Serial.print("CRITICAL ASSUMPTION: Shunt Resistor = ");
+  Serial.print(SENSE_RESISTOR_OHMS, 5);
+  Serial.println(" Ohms.");
+  Serial.println("Please verify and update this value in the code for accurate readings.");
+  Serial.println("---------------------------------------------------------------------");
+
+  // ADC pins do not need pinMode() on the ESP32
+}
+
+
+void loop() {
+  // Read the raw ADC values from the two current sensors
+  int adcValue1 = analogRead(CURRENT_SENSE_PIN_1);
+  int adcValue2 = analogRead(CURRENT_SENSE_PIN_2);
+  
+  // Convert the raw ADC value to the voltage at the ESP32 pin
+  float voltage1 = adcValue1 * (ADC_VREF / ADC_MAX_VALUE);
+  float voltage2 = adcValue2 * (ADC_VREF / ADC_MAX_VALUE);
+
+  // Calculate the current based on the INA240's output voltage formula:
+  // V_out = I_sense * R_shunt * Gain  =>  I_sense = V_out / (Gain * R_shunt)
+  float current1_A = voltage1 / (INA240_GAIN * SENSE_RESISTOR_OHMS);
+  float current2_A = voltage2 / (INA240_GAIN * SENSE_RESISTOR_OHMS);
+
+  // Print the results in a formatted table
+  Serial.println("Sensor | Raw ADC | Voltage (V) | Current (A)");
+  Serial.println("-------|---------|-------------|-------------");
+  Serial.printf("  #1   | %-7d | %-11.3f | %-11.3f\n", adcValue1, voltage1, current1_A);
+  Serial.printf("  #2   | %-7d | %-11.3f | %-11.3f\n", adcValue2, voltage2, current2_A);
+  Serial.println("---------------------------------------------------------------------");
+
+  delay(1000); // Update readings once per second
+}

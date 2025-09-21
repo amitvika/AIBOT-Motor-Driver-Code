@@ -1,0 +1,132 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <math.h>
+ #include <Adafruit_BusIO_Register.h>
+  #include <Adafruit_Sensor.h>
+
+/**************************************************************************/
+/*  Example code for ESP32 + MPU9250 using asukiaaa's MPU9250 library     */
+/*  SDA = GPIO 2, SCL = GPIO 15                                          */
+/*                                                                        */
+/*  This example prints out:                                             */
+/*    - Raw accelerometer (ax, ay, az)                                    */
+/*    - Raw gyroscope (gx, gy, gz)                                        */
+/*    - Raw magnetometer (mx, my, mz)                                     */
+/*    - Calculated pitch, roll, yaw                                       */
+/**************************************************************************/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include "MPU9250_asukiaaa.h"
+
+// Change the address if necessary:
+//   - 0x68 is typical if AD0 pin is low
+//   - 0x69 is used if AD0 pin is high
+#define MPU9250_ADDRESS 0x68
+
+// Create an MPU9250 object
+MPU9250_asukiaaa::MPU9250 sensor(MPU9250_ADDRESS);
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // Initialize I2C on SDA=GPIO2, SCL=GPIO15
+  // Although this is still hardware I2C under the hood on the ESP32,
+  // the pins are remapped from their default (SDA=21, SCL=22).
+  Wire.begin(2, 15);
+
+  // Link the sensor object to the custom Wire instance
+  sensor.setWire(&Wire);
+
+  // Initialize the sensor
+  //   - accelerometer range, gyroscope range, etc. can be configured if desired
+  int status = sensor.beginAccel();
+  if (status != 0) {
+    Serial.print("Failed to initialize Accel, status = ");
+    Serial.println(status);
+  }
+
+  status = sensor.beginGyro();
+  if (status != 0) {
+    Serial.print("Failed to initialize Gyro, status = ");
+    Serial.println(status);
+  }
+
+  status = sensor.beginMag();
+  if (status != 0) {
+    Serial.print("Failed to initialize Mag, status = ");
+    Serial.println(status);
+  }
+
+  // Optionally set sample rates, etc. from the library if needed:
+  // sensor.setAccCoef(0.02f);
+  // sensor.setMagCoef(0.02f);
+  // sensor.setGyrCoef(0.98f);
+
+  Serial.println("MPU9250 initialization complete.");
+}
+
+void loop() {
+  // Update the sensor readings
+  sensor.updateAccel();
+  sensor.updateGyro();
+  sensor.updateMag();
+
+  float ax = sensor.accelX();
+  float ay = sensor.accelY();
+  float az = sensor.accelZ();
+
+  float gx = sensor.gyroX();
+  float gy = sensor.gyroY();
+  float gz = sensor.gyroZ();
+
+  float mx = sensor.magX();
+  float my = sensor.magY();
+  float mz = sensor.magZ();
+
+  // Calculate pitch, roll using accelerometer
+  // pitch (rotation around X-axis), roll (rotation around Y-axis)
+  // NOTE: many variations exist; this is a simple approximate approach.
+  float pitch = atan2(ax, sqrt(ay * ay + az * az)) * 180.0 / M_PI;
+  float roll  = atan2(ay, sqrt(ax * ax + az * az)) * 180.0 / M_PI;
+
+  // Calculate yaw from magnetometer (very rough approach)
+  //   1. Convert magnetometer readings to heading
+  //   2. Adjust if necessary with offsets or tilt correction for accuracy
+  float yaw = atan2(my, mx) * 180.0 / M_PI;
+  if (yaw < 0) yaw += 360.0;
+
+  // Print raw sensor data
+  Serial.print("Accel (g): ");
+  Serial.print(ax, 3);
+  Serial.print(", ");
+  Serial.print(ay, 3);
+  Serial.print(", ");
+  Serial.print(az, 3);
+  Serial.print(" | Gyro (deg/s): ");
+  Serial.print(gx, 3);
+  Serial.print(", ");
+  Serial.print(gy, 3);
+  Serial.print(", ");
+  Serial.print(gz, 3);
+  Serial.print(" | Mag (uT): ");
+  Serial.print(mx, 3);
+  Serial.print(", ");
+  Serial.print(my, 3);
+  Serial.print(", ");
+  Serial.print(mz, 3);
+
+  // Print derived angles
+  Serial.print(" | Pitch: ");
+  Serial.print(pitch, 2);
+  Serial.print("°, Roll: ");
+  Serial.print(roll, 2);
+  Serial.print("°, Yaw: ");
+  Serial.print(yaw, 2);
+  Serial.println("°");
+
+  delay(250); 
+}

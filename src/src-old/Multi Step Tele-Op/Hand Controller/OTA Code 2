@@ -1,0 +1,109 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_BusIO_Register.h>
+#include <Adafruit_Sensor.h>
+#include <HTTPClient.h>
+#include <math.h>
+#include "Adafruit_VL53L0X.h"
+#include <ArduinoOTA.h>
+
+// WiFi credentials
+const char* ssid = "The Best Is Yet To Come!";
+const char* password = "blessings1";
+
+// Define pin assignments based on your wiring
+const int powerPin = 33; // Using digital pin 33 to provide "VCC"
+const int xPin = 32;     // Analog input for VRX (X-axis)
+const int yPin = 35;     // Analog input for VRY (Y-axis)
+const int swPin = 34;    // Digital input for the joystick's button (SW)
+
+// LED configuration (using onboard LED on GPIO2)
+const int LED_PIN = 2;    // LED pin (often onboard on ESP32 boards)
+
+// LEDC (PWM) configuration for ESP32
+const int LEDC_CHANNEL = 0;
+const int LEDC_FREQUENCY = 5000; // PWM frequency in Hz
+const int LEDC_RESOLUTION = 8;   // 8-bit resolution (0-255)
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Connect to WiFi (required for OTA)
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("Connected, IP address: ");
+  Serial.println(WiFi.localIP());
+  
+  // Set up OTA callbacks
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA Update Starting...");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nOTA Update Complete.");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("OTA Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Authentication Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Initialization Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connection Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Reception Failed");
+    else if (error == OTA_END_ERROR) Serial.println("Finalization Failed");
+  });
+  ArduinoOTA.begin();
+  Serial.println("OTA Ready");
+  
+  // Set up the power pin as output and drive it HIGH.
+  digitalWrite(powerPin, HIGH);
+  pinMode(powerPin, OUTPUT);
+  
+  // Set up the joystick button pin with an internal pull-up resistor.
+  pinMode(swPin, INPUT_PULLUP);
+  
+  // Initialize LEDC for PWM on LED_PIN
+  ledcSetup(LEDC_CHANNEL, LEDC_FREQUENCY, LEDC_RESOLUTION);
+  ledcAttachPin(LED_PIN, LEDC_CHANNEL);
+}
+
+void loop() {
+  // Handle OTA updates
+  ArduinoOTA.handle();
+  
+  // Read the analog values for the joystick axes.
+  int xValue = analogRead(xPin);
+  int yValue = analogRead(yPin);
+  
+  // Read the digital state of the joystick button.
+  int buttonState = digitalRead(swPin);
+  
+  // Print the joystick values to the Serial Monitor.
+  Serial.print("X: ");
+  Serial.print(xValue);
+  Serial.print("  Y: ");
+  Serial.print(yValue);
+  Serial.print("  Button: ");
+  Serial.println(buttonState);
+  
+  // Map the joystick X-axis reading (0-4095) to LED brightness (0-255)
+  int brightness = map(xValue, 0, 4095, 0, 255);
+  
+  // If your LED is active low, uncomment the next line to invert the brightness.
+  // brightness = 255 - brightness;
+  
+  // Write the brightness to the LED using PWM
+  ledcWrite(LEDC_CHANNEL, brightness);
+  
+  delay(100); // Delay for readability
+}

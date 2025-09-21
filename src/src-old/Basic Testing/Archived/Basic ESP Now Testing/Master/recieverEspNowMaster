@@ -1,0 +1,134 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_BusIO_Register.h>
+#include <Adafruit_Sensor.h>
+#include <HTTPClient.h>
+#include <math.h> // for roundf()
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+ #include <WiFiClientSecure.h>
+ #include <HTTPClient.h>
+#include <Arduino.h>
+#include <Wire.h>
+#include <Arduino.h>
+#include <Wire.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <math.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <math.h>
+
+// Define Slave MAC Addresses
+//uint8_t slave1MAC[] = {0xD4, 0x8A, 0xFC, 0xC9, 0x1F, 0x30};
+//slave1mac: MAC: 2c:bc:bb:4d:92:88
+uint8_t slave1MAC[] = {0x2C, 0xBC, 0xBB, 0x4D, 0x92, 0x88};
+//uint8_t slave2MAC[] = {0xD4, 0x8A, 0xFC, 0x9F, 0x49, 0x94};
+//uint8_t slave2MAC[] = {0x08, 0xA6, 0xF7, 0xB0, 0x72, 0x1C};
+
+//slave3mac: cc:db:a7:2f:20:44
+uint8_t slave2MAC[] = {0xF8, 0xB3, 0xB7, 0xD2, 0x3B, 0x68};
+
+// Define sine wave parameters
+float angle = 0; // Start angle
+const float increment = 0.1; // Angle increment for sine wave
+const int minValue = 1000; // Minimum value
+const int maxValue = 2400; // Maximum value
+const int amplitude = (maxValue - minValue) / 2;
+const int offset = minValue + amplitude;
+
+// Structure to send actuator positions
+typedef struct {
+    uint16_t actuatorPositions[6];
+} ActuatorData;
+
+ActuatorData dataToSend;
+
+// Callback when data is sent
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    Serial.print("Send Status to ");
+    for (int i = 0; i < 6; i++) {
+        Serial.printf("%02X", mac_addr[i]);
+        if (i < 5) Serial.print(":");
+    }
+    Serial.print(": ");
+    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Failure");
+}
+
+void setup() {
+    Serial.begin(115200);
+
+    // Initialize Wi-Fi in station mode
+    WiFi.mode(WIFI_STA);
+    Serial.print("Master MAC Address: ");
+    Serial.println(WiFi.macAddress());
+
+    // Initialize ESP-NOW
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("Error initializing ESP-NOW");
+        return;
+    }
+
+    // Register the send callback
+    esp_now_register_send_cb(onDataSent);
+
+    // Add Slave 1 as a peer
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, slave1MAC, 6);
+    peerInfo.channel = 0; // Default channel
+    peerInfo.encrypt = false;
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("Failed to add Slave 1");
+        return;
+    }
+    Serial.println("Slave 1 added successfully");
+
+    // Add Slave 2 as a peer
+    memcpy(peerInfo.peer_addr, slave2MAC, 6);
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("Failed to add Slave 2");
+        return;
+    }
+    Serial.println("Slave 2 added successfully");
+}
+
+void loop() {
+    // Generate sine wave values for actuators
+    for (int i = 0; i < 6; i++) {
+        dataToSend.actuatorPositions[i] = offset + amplitude * sin(angle + i * increment);
+    }
+    angle += increment;
+
+    // Send actuator positions to Slave 1
+    esp_err_t result1 = esp_now_send(slave1MAC, (uint8_t *)&dataToSend, sizeof(dataToSend));
+    if (result1 == ESP_OK) {
+        Serial.println("Data sent to Slave 1 successfully");
+    } else {
+        Serial.print("Error sending data to Slave 1: ");
+        Serial.println(result1);
+    }
+
+    // Send actuator positions to Slave 2
+    esp_err_t result2 = esp_now_send(slave2MAC, (uint8_t *)&dataToSend, sizeof(dataToSend));
+    if (result2 == ESP_OK) {
+        Serial.println("Data sent to Slave 2 successfully");
+    } else {
+        Serial.print("Error sending data to Slave 2: ");
+        Serial.println(result2);
+    }
+
+    delay(50); // 20ms update frequency (50 Hz)
+}

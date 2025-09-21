@@ -1,0 +1,299 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+ #include <WiFiClientSecure.h>
+ #include <HTTPClient.h>
+#include <Arduino.h>
+#include <Wire.h>
+#include <Arduino.h>
+#include <Wire.h>
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <esp_now.h>
+
+#define AS5600_ADDRESS 0x36
+
+// Sensor 1 I2C Pins
+#define SDA_PIN_SENSOR1 16
+#define SCL_PIN_SENSOR1 17
+
+// Sensor 2 I2C Pins
+#define SDA_PIN_SENSOR2 27
+#define SCL_PIN_SENSOR2 25
+
+// Motor 1 Control Pins
+#define MOTOR1_CTRL_PIN1 32  // GPIO for one direction
+#define MOTOR1_CTRL_PIN2 12  // GPIO for the opposite direction
+
+// Motor 2 Control Pins
+#define MOTOR2_CTRL_PIN1 22  // GPIO for one direction
+#define MOTOR2_CTRL_PIN2 21  // GPIO for the opposite direction
+
+// Desired positions (initially set to 2000)
+uint16_t desiredPosition1 = 2000;
+uint16_t desiredPosition2 = 2000;
+
+// Enable or disable motors
+bool enableMotor1 = true;  // Set to 'false' to disable Motor 1
+bool enableMotor2 = true;  // Set to 'false' to disable Motor 2
+
+// Variables to remap motor control directions
+uint8_t motor1_forward_pin;
+uint8_t motor1_reverse_pin;
+uint8_t motor2_forward_pin;
+uint8_t motor2_reverse_pin;
+
+// Proportional control constants
+float kp = 1;    // Proportional gain, adjust as needed
+int maxPWM = 255;  // Maximum PWM value
+
+// Control parameters
+int positionErrorAllowance = 3;  // Position error allowance (±3 units)
+int deadZone = 30;               // Dead zone threshold for PWM
+
+// Initialize TwoWire instances for software I2C buses
+TwoWire I2C_Sensor1 = TwoWire(0);
+TwoWire I2C_Sensor2 = TwoWire(1);
+
+// Function to read the raw angle from AS5600 sensor
+uint16_t readAS5600Angle(TwoWire &wireBus) {
+  uint16_t angle = 0;
+
+  wireBus.beginTransmission(AS5600_ADDRESS);
+  wireBus.write(0x0C);  // Register address for 'ANGLE'
+  if (wireBus.endTransmission(false) != 0) {
+    Serial.println("Error: Sensor not responding.");
+    return 0;
+  }
+
+  wireBus.requestFrom(AS5600_ADDRESS, (uint8_t)2);
+  if (wireBus.available() == 2) {
+    uint8_t highByte = wireBus.read();
+    uint8_t lowByte = wireBus.read();
+    angle = ((uint16_t)highByte << 8) | lowByte;
+    angle = angle & 0x0FFF;  // Mask to 12 bits
+  } else {
+    Serial.println("Error: Incomplete data received.");
+  }
+
+  return angle;
+}
+
+// Function to scan I2C bus for device presence
+bool scanI2CBus(TwoWire &wireBus, const char *sensorName) {
+  wireBus.beginTransmission(AS5600_ADDRESS);
+  uint8_t error = wireBus.endTransmission();
+
+  if (error == 0) {
+    Serial.print("I2C device found on ");
+    Serial.println(sensorName);
+    return true;
+  } else {
+    Serial.print("No I2C device found on ");
+    Serial.println(sensorName);
+    return false;
+  }
+}
+
+// Function to control motor based on sensor feedback
+void controlMotor(uint16_t currentPosition, uint16_t desiredPosition, uint8_t forwardPin, uint8_t reversePin, const char* motorName) {
+  int error = desiredPosition - currentPosition;
+
+  // Implement position error allowance
+  if (abs(error) <= positionErrorAllowance) {
+    // Within acceptable range, stop the motor
+    analogWrite(forwardPin, 0);
+    analogWrite(reversePin, 0);
+    return;
+  }
+
+  int pwmValue = kp * error;
+
+  // Constrain PWM value to allowable range
+  pwmValue = constrain(pwmValue, -maxPWM, maxPWM);
+
+  // Implement dead zone
+  if (pwmValue > 0) {
+    // Adjust PWM to ensure it's outside the dead zone
+    pwmValue = max(pwmValue, deadZone);
+  } else if (pwmValue < 0) {
+    pwmValue = min(pwmValue, -deadZone);
+  }
+
+  if (pwmValue > 0) {
+    // Move forward
+    analogWrite(forwardPin, pwmValue);
+    analogWrite(reversePin, 0);
+  } else if (pwmValue < 0) {
+    // Move reverse
+    analogWrite(forwardPin, 0);
+    analogWrite(reversePin, -pwmValue);
+  } else {
+    // Stop motor
+    analogWrite(forwardPin, 0);
+    analogWrite(reversePin, 0);
+  }
+}
+
+// Function to stop motor
+void stopMotor(uint8_t forwardPin, uint8_t reversePin) {
+  analogWrite(forwardPin, 0);
+  analogWrite(reversePin, 0);
+}
+
+// Calibration function for motor direction
+void calibrateMotor(uint8_t forwardPin, uint8_t reversePin, TwoWire &wireBus, const char* motorName, uint8_t &mappedForwardPin, uint8_t &mappedReversePin) {
+  Serial.print("Calibrating ");
+  Serial.println(motorName);
+
+  // Stop the motor
+  stopMotor(forwardPin, reversePin);
+
+  // Read initial sensor value
+  uint16_t initialPosition = readAS5600Angle(wireBus);
+  Serial.print("Initial Position: ");
+  Serial.println(initialPosition);
+
+  // Move motor forward for a short duration
+  analogWrite(forwardPin, 100);  // Use a safe PWM value
+  analogWrite(reversePin, 0);
+  delay(500);  // Move for 500ms
+  stopMotor(forwardPin, reversePin);
+
+  // Read new sensor value
+  uint16_t newPosition = readAS5600Angle(wireBus);
+  Serial.print("New Position: ");
+  Serial.println(newPosition);
+
+  // Determine if sensor value increased or decreased
+  if (newPosition > initialPosition) {
+    Serial.println("Sensor value increased. Direction mapping is correct.");
+    mappedForwardPin = forwardPin;
+    mappedReversePin = reversePin;
+  } else {
+    Serial.println("Sensor value decreased. Swapping motor control pins.");
+    mappedForwardPin = reversePin;
+    mappedReversePin = forwardPin;
+  }
+
+  Serial.println("-----------------------------");
+}
+
+// ESP-NOW callback function when data is received
+void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
+  if (len == sizeof(uint16_t) * 2) {
+    // Assuming the data is two uint16_t values for desiredPosition1 and desiredPosition2
+    uint16_t receivedPositions[2];
+    memcpy(receivedPositions, incomingData, len);
+    desiredPosition1 = receivedPositions[0];
+    desiredPosition2 = receivedPositions[1];
+    Serial.print("Received desired positions: ");
+    Serial.print(desiredPosition1);
+    Serial.print(", ");
+    Serial.println(desiredPosition2);
+  } else {
+    Serial.println("Received data with unexpected length");
+  }
+}
+
+void setup() {
+  // Initialize Serial Monitor
+  Serial.begin(115200);
+  delay(1000);  // Wait for Serial Monitor to initialize
+
+  // Initialize I2C buses
+  I2C_Sensor1.begin(SDA_PIN_SENSOR1, SCL_PIN_SENSOR1);
+  I2C_Sensor1.setClock(400000);
+
+  I2C_Sensor2.begin(SDA_PIN_SENSOR2, SCL_PIN_SENSOR2);
+  I2C_Sensor2.setClock(400000);
+
+  // Initialize motor control pins
+  pinMode(MOTOR1_CTRL_PIN1, OUTPUT);
+  pinMode(MOTOR1_CTRL_PIN2, OUTPUT);
+  pinMode(MOTOR2_CTRL_PIN1, OUTPUT);
+  pinMode(MOTOR2_CTRL_PIN2, OUTPUT);
+
+  // Ensure motors are stopped
+  stopMotor(MOTOR1_CTRL_PIN1, MOTOR1_CTRL_PIN2);
+  stopMotor(MOTOR2_CTRL_PIN1, MOTOR2_CTRL_PIN2);
+
+  // Check sensors
+  if (scanI2CBus(I2C_Sensor1, "Sensor 1")) {
+    Serial.println("AS5600 Sensor 1 detected.");
+  } else {
+    Serial.println("AS5600 Sensor 1 not detected.");
+  }
+
+  if (scanI2CBus(I2C_Sensor2, "Sensor 2")) {
+    Serial.println("AS5600 Sensor 2 detected.");
+  } else {
+    Serial.println("AS5600 Sensor 2 not detected.");
+  }
+
+  // Calibrate Motor 1
+  if (enableMotor1) {
+    calibrateMotor(MOTOR1_CTRL_PIN1, MOTOR1_CTRL_PIN2, I2C_Sensor1, "Motor 1", motor1_forward_pin, motor1_reverse_pin);
+  }
+
+  // Calibrate Motor 2
+  if (enableMotor2) {
+    calibrateMotor(MOTOR2_CTRL_PIN1, MOTOR2_CTRL_PIN2, I2C_Sensor2, "Motor 2", motor2_forward_pin, motor2_reverse_pin);
+  }
+
+  // Ensure motors are stopped after calibration
+  if (enableMotor1) stopMotor(motor1_forward_pin, motor1_reverse_pin);
+  if (enableMotor2) stopMotor(motor2_forward_pin, motor2_reverse_pin);
+
+  // Initialize WiFi and ESP-NOW
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();  // Disconnect from any network
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+
+  // Register receive callback function
+  esp_now_register_recv_cb(onDataRecv);
+
+  // Print the MAC Address of the Slave
+  Serial.print("Slave MAC Address: ");
+  Serial.println(WiFi.macAddress());
+}
+
+void loop() {
+  // Read angles from sensors
+  uint16_t angle1 = readAS5600Angle(I2C_Sensor1);
+  uint16_t angle2 = readAS5600Angle(I2C_Sensor2);
+
+  // Calculate errors
+  int error1 = desiredPosition1 - angle1;
+  int error2 = desiredPosition2 - angle2;
+
+  // Print sensor readings and errors on the same line
+  Serial.print("Angle1: ");
+  Serial.print(angle1);
+  Serial.print(" Error1: ");
+  Serial.print(error1);
+  Serial.print("  Angle2: ");
+  Serial.print(angle2);
+  Serial.print(" Error2: ");
+  Serial.println(error2);
+
+  // Control motors to reach desired positions
+  if (enableMotor1) {
+    controlMotor(angle1, desiredPosition1, motor1_forward_pin, motor1_reverse_pin, "Motor 1");
+  } else {
+    stopMotor(motor1_forward_pin, motor1_reverse_pin);
+  }
+
+  if (enableMotor2) {
+    controlMotor(angle2, desiredPosition2, motor2_forward_pin, motor2_reverse_pin, "Motor 2");
+  } else {
+    stopMotor(motor2_forward_pin, motor2_reverse_pin);
+  }
+
+  delay(10);  // Adjust delay as needed
+}

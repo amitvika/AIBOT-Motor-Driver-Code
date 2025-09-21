@@ -1,0 +1,85 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <Adafruit_BusIO_Register.h>
+#include <Adafruit_Sensor.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <ESP32Servo.h>    // madhephaestus/ESP32Servo@^3.0.6
+#include <string.h>
+
+#define SERVO_PIN 18
+#define MAX_BUF   256
+
+Servo servo1;
+
+// ESP-NOW receive callback
+void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+  if (len <= 0) return;
+
+  // Copy into a null-terminated buffer
+  char buf[MAX_BUF];
+  int toCopy = min(len, MAX_BUF - 1);
+  memcpy(buf, incomingData, toCopy);
+  buf[toCopy] = '\0';
+
+  Serial.print("Raw ESP‑NOW: ");
+  Serial.println(buf);
+
+  // Parse "key=val;" tokens
+  char *tok = strtok(buf, ";");
+  while (tok) {
+    char *eq = strchr(tok, '=');
+    if (eq) {
+      *eq = '\0';
+      char *key = tok;
+      char *val = eq + 1;
+
+      if (strcmp(key, "g2") == 0) {
+        int g1 = atoi(val);
+        g1 = constrain(g1, 0, 100);
+        // Map 0–100 → 0°–180°
+        int angle = map(g1, 0, 100, 0, 180);
+        servo1.write(angle);
+        Serial.printf(" → servo→%d° (g1=%d)\n", angle, g1);
+      }
+    }
+    tok = strtok(NULL, ";");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // 1) Allocate one of the four available PWM timers
+  ESP32PWM::allocateTimer(0);
+  // 2) Set servo refresh to 50 Hz (standard hobby servo)
+  servo1.setPeriodHertz(50);
+  // 3) Attach to pin 18; you can optionally specify min/max pulse width in us:
+  //    servo1.attach(SERVO_PIN, 500, 2500);
+  servo1.attach(SERVO_PIN);
+
+  // ESP‑NOW init
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP‑NOW");
+    return;
+  }
+  esp_now_register_recv_cb(onDataRecv);
+
+  Serial.print("ESP‑NOW servo receiver MAC: ");
+  Serial.println(WiFi.macAddress());
+}
+
+void loop() {
+  // nothing here—servo updates happen in onDataRecv()
+  delay(100);
+}

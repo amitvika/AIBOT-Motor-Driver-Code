@@ -1,0 +1,51 @@
+#include <Arduino.h>
+#include "driver/twai.h" // The native ESP-IDF TWAI/CAN driver
+
+//-- Pin Definitions from your Schematic --//
+const int CAN_STBY_PIN = 47; 
+const gpio_num_t CAN_TX_PIN = GPIO_NUM_48;
+const gpio_num_t CAN_RX_PIN = GPIO_NUM_34;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+  Serial.println("--- Native TWAI/CAN Receiver ---");
+
+  // Step 1: Enable the CAN transceiver chip
+  pinMode(CAN_STBY_PIN, OUTPUT);
+  digitalWrite(CAN_STBY_PIN, LOW);
+
+  // Step 2: Configure the TWAI driver
+  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
+  twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
+  twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+  // Step 3: Install and start the driver
+  if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
+    Serial.println("Failed to install TWAI driver");
+    return;
+  }
+  if (twai_start() != ESP_OK) {
+    Serial.println("Failed to start TWAI driver");
+    return;
+  }
+
+  Serial.println("Driver started. Listening for messages...");
+}
+
+void loop() {
+  twai_message_t message;
+
+  // Wait for a message to be received
+  if (twai_receive(&message, pdMS_TO_TICKS(10000)) == ESP_OK) {
+    Serial.printf("Message received | ID: 0x%lX | DLC: %d | Data: ", message.identifier, message.data_length_code);
+    
+    // Print the data bytes
+    for (int i = 0; i < message.data_length_code; i++) {
+      Serial.printf("0x%02X ", message.data[i]);
+    }
+    Serial.println();
+  } else {
+    Serial.println("No message received within timeout.");
+  }
+}

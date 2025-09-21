@@ -1,0 +1,57 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_BusIO_Register.h>
+#include <Adafruit_Sensor.h>
+#include <HTTPClient.h>
+#include <math.h> // for roundf()
+#include <Wire.h>
+#include "Adafruit_VL53L0X.h"
+
+// Create the VL53L0X object
+Adafruit_VL53L0X lox = Adafruit_VL53L0X();
+
+void setup() {
+Serial.begin(115200);
+delay(100);
+
+// Initialize I2C with custom pins: SDA on 2, SCL on 15
+Wire.begin(2, 15);
+
+// Optional: set clock to 100kHz (default) or 400kHz
+// Wire.setClock(100000);  // or 400000 for 400kHz
+
+// Give some time after I2C init
+delay(100);
+
+// Initialize the VL53L0X sensor
+if (!lox.begin()) {
+  Serial.println("Failed to find VL53L0X sensor!");
+  while (1) { 
+    // If we reach here, sensor was not detected.
+    // You can add a delay or attempt to re-initialize.
+  }
+}
+
+Serial.println("VL53L0X sensor initialized successfully.");
+}
+
+void loop() {
+// Create a measurement object
+VL53L0X_RangingMeasurementData_t measure;
+
+// Perform a ranging measurement
+lox.rangingTest(&measure, false); // pass in 'true' to get debug data
+
+if (measure.RangeStatus != 4) {  // phase failures have a range status of 4
+  Serial.print("Distance (mm): ");
+  Serial.println(measure.RangeMilliMeter);
+} else {
+  Serial.println("Out of range");
+}
+
+delay(200); // Adjust delay as needed
+}

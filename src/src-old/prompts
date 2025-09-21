@@ -1,0 +1,1 @@
+one weird thing that happens with this board is that when i hit the reset button, transiently, the transistors short to ground and they get hot. This is not good if that keeps happening on startup. Also same situation in boot mode. except it stays shorted until it exits boot.  

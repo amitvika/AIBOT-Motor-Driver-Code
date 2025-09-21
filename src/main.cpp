@@ -1,0 +1,104 @@
+#include <Arduino.h>
+#include "driver/twai.h" // The native ESP-IDF TWAI/CAN driver
+
+//-- Pin Definitions from your Schematic --//
+const int CAN_STBY_PIN = 47; 
+const gpio_num_t CAN_TX_PIN = GPIO_NUM_48;
+const gpio_num_t CAN_RX_PIN = GPIO_NUM_34;
+
+//-- Timing for sending messages --//
+const unsigned long sendInterval = 2000; // Send a message every 2000 milliseconds (2 seconds)
+unsigned long previousMillis = 0;         // Stores the last time a message was sent
+
+// --- Function Prototypes --- //
+void setupCAN();
+void receiveCAN();
+void sendCAN();
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+  Serial.println("--- Native TWAI/CAN Sender & Receiver ---");
+
+  setupCAN();
+}
+
+void loop() {
+  // 1. Check for and print any incoming messages
+  receiveCAN();
+
+  // 2. Send a message periodically on a non-blocking timer
+  sendCAN();
+}
+
+/**
+ * @brief Configures, installs, and starts the ESP32's native TWAI/CAN driver.
+ */
+void setupCAN() {
+  // Step 1: Enable the CAN transceiver chip (e.g., TJA1050)
+  pinMode(CAN_STBY_PIN, OUTPUT);
+  digitalWrite(CAN_STBY_PIN, LOW); // Set to LOW for normal/active mode
+
+  // Step 2: Configure the TWAI driver
+  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
+  twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS(); // Must match your RPi's bitrate
+  twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+  // Step 3: Install and start the driver
+  if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
+    Serial.println("Failed to install TWAI driver");
+    return;
+  }
+  if (twai_start() != ESP_OK) {
+    Serial.println("Failed to start TWAI driver");
+    return;
+  }
+
+  Serial.println("CAN Driver started successfully!");
+}
+
+/**
+ * @brief Checks for a received CAN message without blocking the loop.
+ */
+void receiveCAN() {
+  twai_message_t message;
+
+  // Check for a message with a very short timeout (10ms) to avoid blocking
+  if (twai_receive(&message, pdMS_TO_TICKS(10)) == ESP_OK) {
+    Serial.printf("RECEIVED << ID: 0x%lX | DLC: %d | Data: ", message.identifier, message.data_length_code);
+    
+    // Print the data bytes
+    for (int i = 0; i < message.data_length_code; i++) {
+      Serial.printf("0x%02X ", message.data[i]);
+    }
+    Serial.println();
+  }
+}
+
+/**
+ * @brief Sends a CAN message every 'sendInterval' milliseconds.
+ */
+void sendCAN() {
+  // Check if it's time to send a message
+  if (millis() - previousMillis >= sendInterval) {
+    previousMillis = millis(); // Update the timer
+
+    // Prepare the message to send
+    twai_message_t message;
+    message.identifier = 0x200; // Message ID
+    message.flags = TWAI_MSG_FLAG_NONE; // Standard CAN frame
+    message.data_length_code = 4;
+    message.data[0] = 0xAA;
+    message.data[1] = 0xBB;
+    message.data[2] = 0xCC;
+    message.data[3] = 0xDD;
+
+    // Transmit the message
+    if (twai_transmit(&message, pdMS_TO_TICKS(1000)) == ESP_OK) {
+      Serial.printf("SENT >> ID: 0x%lX | Data: 0x%02X 0x%02X 0x%02X 0x%02X\n",
+                    message.identifier, message.data[0], message.data[1], message.data[2], message.data[3]);
+    } else {
+      Serial.println("Failed to send message");
+    }
+  }
+}

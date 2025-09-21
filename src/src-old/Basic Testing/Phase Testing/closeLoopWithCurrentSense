@@ -1,0 +1,136 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <SimpleFOC.h>
+
+// ===== Motor / driver =====
+#define POLE_PAIRS          7
+const float SUPPLY_VOLTAGE   = 25.0;
+const float VOLTAGE_LIMIT    = 4.0;     // cap applied voltage
+const long  PWM_FREQ         = 25000;
+const float TARGET_RPS       = 1.0f;
+
+const int PIN_U = 38, PIN_V = 39, PIN_W = 40;
+
+// ===== AS5047P (custom SPI pins you confirmed) =====
+const int SPI_CS_PIN   = 4;
+const int SPI_SCK_PIN  = 12;
+const int SPI_MISO_PIN = 13;
+const int SPI_MOSI_PIN = 14;
+MagneticSensorSPI sensor(AS5047_SPI, SPI_CS_PIN);
+
+// ===== INA240 two-phase current sense (direct ADC read) =====
+const int CSENSE1_PIN = 8;   // your board
+const int CSENSE2_PIN = 9;   // your board
+
+// Hardware numbers
+const float ADC_VREF         = 3.3f;
+const float ADC_MAX          = 4095.0f;     // 12-bit
+const float SENSE_RES_OHM    = 0.001f;      // 1 mΩ (your schematic)
+const float INA240_GAIN      = 50.0f;       // INA240A2
+
+// Soft limit thresholds
+float I_LIMIT = 1.2f;   // start conservative (A)
+float I_HARD  = 2.0f;   // clamp (A)
+
+// Offsets (measured at boot)
+float v_off1 = 0.0f, v_off2 = 0.0f;
+
+// Helpers
+inline float adcToV(int raw) { return (raw * (ADC_VREF / ADC_MAX)); }
+
+BLDCMotor motor(POLE_PAIRS);
+BLDCDriver3PWM driver(PIN_U, PIN_V, PIN_W);
+
+void calibrateCurrentOffsets(uint16_t n=800){
+  double acc1=0, acc2=0;
+  for(uint16_t i=0;i<n;i++){
+    acc1 += adcToV(analogRead(CSENSE1_PIN));
+    acc2 += adcToV(analogRead(CSENSE2_PIN));
+    delayMicroseconds(200);
+  }
+  v_off1 = acc1 / n;
+  v_off2 = acc2 / n;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println(F("\n[BOOT] Velocity control + soft current limit (INA240 direct)"));
+
+  // SPI on your custom pins
+  pinMode(SPI_CS_PIN, OUTPUT); digitalWrite(SPI_CS_PIN, HIGH);
+  SPI.begin(SPI_SCK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN, SPI_CS_PIN);
+  sensor.init();
+  Serial.println(F("[OK] Sensor init"));
+
+  // ADC config
+  analogReadResolution(12);
+  analogSetPinAttenuation(CSENSE1_PIN, ADC_11db);
+  analogSetPinAttenuation(CSENSE2_PIN, ADC_11db);
+  calibrateCurrentOffsets();
+  Serial.print(F("[OK] Current offsets V: ")); Serial.print(v_off1,4);
+  Serial.print(F(", ")); Serial.println(v_off2,4);
+
+  // Driver
+  driver.voltage_power_supply = SUPPLY_VOLTAGE;
+  driver.pwm_frequency        = PWM_FREQ;
+  driver.init();
+  driver.enable();
+
+  // Motor
+  motor.linkDriver(&driver);
+  motor.linkSensor(&sensor);
+  motor.controller        = MotionControlType::velocity;   // closed-loop velocity
+  motor.torque_controller = TorqueControlType::voltage;    // voltage torque (no FOC current loop)
+  motor.voltage_limit     = VOLTAGE_LIMIT;
+
+  // Velocity PID
+  motor.PID_velocity.P  = 0.25f;
+  motor.PID_velocity.I  = 6.0f;
+  motor.PID_velocity.D  = 0.0f;
+  motor.LPF_velocity.Tf = 0.02f;
+
+  motor.init();
+  motor.initFOC();
+  Serial.println(F("[RUN] Velocity 1 rps with soft current clamp"));
+}
+
+void loop() {
+  motor.loopFOC();
+
+  // --- read phase currents from INA240s (approximate, no vector transform) ---
+  float v1 = adcToV(analogRead(CSENSE1_PIN)) - v_off1;
+  float v2 = adcToV(analogRead(CSENSE2_PIN)) - v_off2;
+  float i1 = v1 / (INA240_GAIN * SENSE_RES_OHM);
+  float i2 = v2 / (INA240_GAIN * SENSE_RES_OHM);
+
+  // Use the worst (magnitude) as a simple proxy of phase current
+  float Iabs = max(fabs(i1), fabs(i2));
+
+  // --- soft current limiter (piecewise linear clamp) ---
+  float scale = 1.0f;
+  if (Iabs >= I_HARD) {
+    scale = 0.0f;                 // hard clamp
+  } else if (Iabs > I_LIMIT) {
+    scale = (I_HARD - Iabs) / (I_HARD - I_LIMIT);  // taper
+  }
+
+  // optional: gently low-pass the scale to avoid chatter
+  static float scale_f = 1.0f;
+  scale_f = 0.8f*scale_f + 0.2f*scale;
+
+  // Command velocity with clamp
+  const float target_rad_s = 2.0f * PI * TARGET_RPS * scale_f;
+  motor.move(target_rad_s);
+
+  // Telemetry
+  static uint32_t t0 = 0;
+  if (millis() - t0 > 250) {
+    t0 = millis();
+    Serial.print(F("I1=")); Serial.print(i1,3);
+    Serial.print(F("  I2=")); Serial.print(i2,3);
+    Serial.print(F("  Iabs=")); Serial.print(Iabs,3);
+    Serial.print(F("  scale=")); Serial.print(scale_f,2);
+    Serial.print(F("  vel=")); Serial.println(sensor.getVelocity(),2);
+  }
+}

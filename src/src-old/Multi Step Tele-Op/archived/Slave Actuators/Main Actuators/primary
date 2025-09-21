@@ -1,0 +1,198 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_BusIO_Register.h>
+#include <Adafruit_Sensor.h>
+#include <HTTPClient.h>
+
+// I2C Pins (Hardware I2C on ESP32)
+#define SDA_PIN_SENSOR 21
+#define SCL_PIN_SENSOR 22
+
+// Motor Control Pins
+#define MOTOR_CTRL_PIN1 13
+#define MOTOR_CTRL_PIN2 14
+#define MOTOR_ENABLE_PIN 12  // Must be driven HIGH to enable the motor
+
+#define AS5600_ADDRESS 0x36
+
+// Control parameters
+uint16_t desiredPosition = 2000;  
+float kp = 5;
+int maxPWM = 255;
+int positionErrorAllowance = 2;
+int deadZone = 25;
+
+// For validation of sensor readings
+uint16_t lastValidAngle = 2000; 
+const uint16_t maxAllowedJump = 5000; 
+
+// -------------------------------------------------
+// Function to parse key-value data (e.g. "h1X=123;u=1;...")
+// looking specifically for "h1X=..."
+void parseKeyValueLine(char* line) {
+    // Split by semicolons
+    char* token = strtok(line, ";");
+    while (token != NULL) {
+        // Look for '=' in the current token
+        char* eqPos = strchr(token, '=');
+        if (eqPos) {
+            *eqPos = '\0';  // Null-terminate at '='
+            char* key = token;
+            char* val = eqPos + 1;
+
+            // If the key is "h1X", update desiredPosition
+            if (!strcmp(key, "h1X")) {
+                desiredPosition = atoi(val); 
+            }
+        }
+        token = strtok(NULL, ";");
+    }
+}
+
+// -------------------------------------------------
+// ESPNOW receive callback - parse the incoming data
+void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
+    if (len <= 0) return;
+
+    // Copy to a buffer so we can parse
+    char buffer[256];
+    int copyLen = (len < 255) ? len : 255;
+    memcpy(buffer, incomingData, copyLen);
+    buffer[copyLen] = '\0';
+
+    // Parse the entire buffer, looking for h1X=...
+    parseKeyValueLine(buffer);
+}
+
+// -------------------------------------------------
+uint16_t readAS5600Angle(TwoWire &wireBus, uint16_t &lastValidAngle) {
+    uint16_t angle = 0;
+
+    wireBus.beginTransmission(AS5600_ADDRESS);
+    wireBus.write(0x0C);
+    if (wireBus.endTransmission(false) != 0) {
+        return lastValidAngle;
+    }
+
+    wireBus.requestFrom(AS5600_ADDRESS, (uint8_t)2);
+    if (wireBus.available() == 2) {
+        uint8_t highByte = wireBus.read();
+        uint8_t lowByte  = wireBus.read();
+        angle = ((uint16_t)highByte << 8) | lowByte;
+        angle = angle & 0x0FFF;
+
+        if (abs((int)angle - (int)lastValidAngle) > maxAllowedJump) {
+            // Discard if jump is too large
+            return lastValidAngle;
+        }
+        lastValidAngle = angle;
+    } else {
+        // If we couldn't read properly, return last valid
+        return lastValidAngle;
+    }
+
+    return angle;
+}
+
+// -------------------------------------------------
+int computeTargetPWM(uint16_t currentPosition, uint16_t desiredPosition) {
+    int error = desiredPosition - currentPosition;
+
+    // If we're close enough, stop
+    if (abs(error) <= positionErrorAllowance) {
+        return 0;
+    }
+
+    // Proportional control
+    int pwmValue = kp * error;
+    pwmValue = constrain(pwmValue, -maxPWM, maxPWM);
+
+    // Respect dead zone
+    if (pwmValue > 0) {
+        pwmValue = max(pwmValue, deadZone);
+    } else if (pwmValue < 0) {
+        pwmValue = min(pwmValue, -deadZone);
+    }
+
+    return pwmValue;
+}
+
+// -------------------------------------------------
+void applyPWM(int pwmValue, uint8_t forwardPin, uint8_t reversePin) {
+    if (pwmValue > 0) {
+        ledcWrite(0, pwmValue);
+        ledcWrite(1, 0);
+    } else if (pwmValue < 0) {
+        ledcWrite(0, 0);
+        ledcWrite(1, -pwmValue);
+    } else {
+        ledcWrite(0, 0);
+        ledcWrite(1, 0);
+    }
+}
+
+// -------------------------------------------------
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    // Example input pins (optional depending on your setup)
+    pinMode(32, INPUT_PULLUP);
+    pinMode(16, INPUT_PULLUP);
+    pinMode(21, INPUT_PULLUP);
+    pinMode(4, INPUT_PULLDOWN);
+
+    // Enable motor driver
+    pinMode(MOTOR_ENABLE_PIN, OUTPUT);
+    digitalWrite(MOTOR_ENABLE_PIN, HIGH);
+
+    // Setup PWM channels
+    ledcSetup(0, 20000, 8);
+    ledcSetup(1, 20000, 8);
+    ledcAttachPin(MOTOR_CTRL_PIN1, 0);
+    ledcAttachPin(MOTOR_CTRL_PIN2, 1);
+
+    // Start I2C for AS5600
+    Wire.begin(SDA_PIN_SENSOR, SCL_PIN_SENSOR);
+
+    // ESP-NOW init
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("Error initializing ESP-NOW");
+        return;
+    }
+    esp_now_register_recv_cb(onDataRecv);
+
+    Serial.print("Slave MAC Address: ");
+    Serial.println(WiFi.macAddress());
+}
+
+// -------------------------------------------------
+void loop() {
+    // Read angle from AS5600 sensor
+    uint16_t angle = readAS5600Angle(Wire, lastValidAngle);
+
+    // Compute PWM based on desiredPosition vs actual angle
+    int targetPWM = computeTargetPWM(angle, desiredPosition);
+
+    // Apply motor control signal
+    applyPWM(targetPWM, MOTOR_CTRL_PIN1, MOTOR_CTRL_PIN2);
+
+    // Debug printing
+    int error = desiredPosition - angle;
+    Serial.print("Angle: ");
+    Serial.print(angle);
+    Serial.print("  Desired: ");
+    Serial.print(desiredPosition);
+    Serial.print("  Error: ");
+    Serial.print(error);
+    Serial.print("  TargetPWM: ");
+    Serial.println(targetPWM);
+
+    delay(10);
+}

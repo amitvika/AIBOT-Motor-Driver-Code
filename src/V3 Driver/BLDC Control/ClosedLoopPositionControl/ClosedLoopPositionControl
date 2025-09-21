@@ -1,0 +1,142 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <SimpleFOC.h>
+
+// ==========================================================================
+// Custom Sensor Class (No changes)
+// ==========================================================================
+class MyAS5047PSensor : public Sensor {
+public:
+  MyAS5047PSensor() : spi_settings(10000000, MSBFIRST, SPI_MODE1) {}
+  void init() override {
+    pinMode(4, OUTPUT);
+    digitalWrite(4, HIGH);
+    SPI.begin(12, 13, 14);
+  }
+  float getSensorAngle() override {
+    uint16_t raw_angle = readRawAngle();
+    return (float)raw_angle * (_2PI / 16384.0f);
+  }
+private:
+  uint16_t readRawAngle() {
+    const uint16_t REG_ANGLEUNC = 0x3FFE, REG_NOP = 0x0000, CMD_READ_FLAG = 0x4000;
+    uint16_t command = CMD_READ_FLAG | REG_ANGLEUNC;
+    if (calculateEvenParity(command)) command |= 0x8000;
+    SPI.beginTransaction(spi_settings);
+    digitalWrite(4, LOW);
+    SPI.transfer16(command);
+    digitalWrite(4, HIGH);
+    SPI.endTransaction();
+    delayMicroseconds(1);
+    command = CMD_READ_FLAG | REG_NOP;
+    if (calculateEvenParity(command)) command |= 0x8000;
+    SPI.beginTransaction(spi_settings);
+    digitalWrite(4, LOW);
+    uint16_t receivedData = SPI.transfer16(command);
+    digitalWrite(4, HIGH);
+    SPI.endTransaction();
+    return receivedData & 0x3FFF;
+  }
+  uint8_t calculateEvenParity(uint16_t value) {
+    uint8_t count = 0;
+    for (int i = 0; i < 16; i++) {
+      if (value & 0x01) count++;
+      value >>= 1;
+    }
+    return count % 2;
+  }
+  SPISettings spi_settings;
+};
+
+// ==========================================================================
+// Main FOC Application
+// ==========================================================================
+
+const int PIN_U = 38, PIN_V = 39, PIN_W = 40;
+const int POLE_PAIRS = 7;
+
+BLDCMotor motor(POLE_PAIRS);
+BLDCDriver3PWM driver(PIN_U, PIN_V, PIN_W, NOT_SET);
+MyAS5047PSensor sensor;
+
+// <-- CHANGE #1: Define target velocity in a variable
+float target_velocity_rads = 150.0f;
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println(F("Motor Control with Custom Sensor"));
+
+  sensor.init();
+  motor.linkSensor(&sensor);
+
+  driver.voltage_power_supply = 25.0;
+  driver.pwm_frequency = 3000;
+  driver.init();
+  motor.linkDriver(&driver);
+  
+  motor.voltage_limit = 25.0;
+  motor.voltage_sensor_align = 3.0;
+  motor.velocity_limit = 1000.0f;
+  
+  motor.controller = MotionControlType::angle;
+  motor.torque_controller = TorqueControlType::voltage;
+  motor.foc_modulation = FOCModulationType::SpaceVectorPWM;
+
+motor.PID_velocity.P = 0.5f;  // Increase the proportional response
+motor.PID_velocity.I = 0.15f;
+  motor.PID_velocity.D = 0.0f;
+  motor.LPF_velocity.Tf = 0.2f;
+
+  // Verbose output during alignment
+  motor.monitor_port = &Serial;
+
+  motor.init();
+  
+
+  
+  motor.zero_electric_angle = 2.85f;        // comment out to use automatic alignment
+   motor.sensor_direction = Direction::CCW;  // comment out to use automatic alignment
+
+  motor.initFOC();
+
+  // Print the determined alignment values
+  Serial.print(F("Zero electric angle: "));
+  Serial.println(motor.zero_electric_angle, 4);
+
+  // <-- CHANGE HERE: Print the determined sensor direction
+  Serial.print(F("Sensor direction: "));
+  if (motor.sensor_direction == Direction::CW) {
+    Serial.println(F("CW"));
+  } else if (motor.sensor_direction == Direction::CCW) {
+    Serial.println(F("CCW"));
+  } else {
+    Serial.println(F("UNKNOWN"));
+  }
+  
+  Serial.println(F("Motor ready."));
+ 
+  // No longer need the monitor after startup
+  motor.monitor_port = nullptr;
+}
+
+void loop() {
+  motor.loopFOC();
+  motor.move(target_velocity_rads);
+
+  // Print the RPM every 100ms
+  static long last_print_ts = 0;
+  if (millis() - last_print_ts > 100) {
+    last_print_ts = millis();
+    
+    // <-- CHANGE #3: Calculate target RPM and print it dynamically
+    float target_rpm = target_velocity_rads * 9.5493f;
+    float actual_rpm = motor.shaft_velocity * 9.5493f; 
+    
+    Serial.print("Target: ");
+    Serial.print(target_rpm);
+    Serial.print(" RPM | Actual: ");
+    Serial.print(actual_rpm);
+    Serial.println(" RPM");
+  }
+}
